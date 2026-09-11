@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.3, derived from the 265Encode workflow.
+# AV1Encode 1.3.1, derived from the 265Encode workflow.
 # The VA-API filter chain now normalizes every frame to the input stream's initial
 # dimensions before it reaches the encoder, preventing an incompatible software
 # auto-scaler from being inserted after hwupload.
@@ -11,7 +11,7 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.3"
+SCRIPT_VERSION="1.3.1"
 MACHINE_INTERFACE_VERSION="1"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
@@ -1172,8 +1172,10 @@ configure_encoder() {
             VIDEO_FILTER_ARGS=()
             VIDEO_ENCODER_ARGS=(
                 -c:v:0 av1_vaapi
-                -rc_mode:v:0 CQP
-                -qp:v:0 "$HARDWARE_QP"
+                # FFmpeg 9 treats these VA-API private options as unscoped.
+                # Adding :v:0 makes FFmpeg ignore them and use its defaults.
+                -rc_mode CQP
+                -qp "$HARDWARE_QP"
             )
             ;;
         *)
