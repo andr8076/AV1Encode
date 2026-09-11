@@ -1,0 +1,139 @@
+name: Build AV1Compare quality runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/packaging/quality-runtime/**'
+      - '.github/workflows/quality-runtime.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: quality-runtime-latest
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+          - runner: macos-15-intel
+            target: macos-x86_64
+          - runner: macos-15
+            target: macos-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl git meson ninja-build pkg-config nasm yasm \
+            libdrm-dev libva-dev
+          sudo apt-get install -y libvpl-dev || true
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install meson ninja pkg-config nasm yasm
+
+      - name: Build pinned FFmpeg and VMAF runtime
+        shell: bash
+        run: bash tools/packaging/quality-runtime/build.sh
+
+      - name: Smoke-test runtime
+        shell: bash
+        run: bash tools/packaging/quality-runtime/smoke-test.sh dist/media-runtime/runtime
+
+      - name: Package runtime
+        shell: bash
+        run: |
+          asset="av1encode-quality-runtime-${{ matrix.target }}.tar.gz"
+          tar -C dist/media-runtime -czf "$asset" runtime
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          mkdir -p release-assets
+          mv "$asset" "$asset.sha256" release-assets/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quality-runtime-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: quality-runtime-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate complete release set
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          targets=(linux-x86_64 linux-arm64 macos-x86_64 macos-arm64)
+          for target in "${targets[@]}"; do
+            asset="release-assets/av1encode-quality-runtime-${target}.tar.gz"
+            listing="release-assets/${target}.listing"
+            [[ -s $asset && -s $asset.sha256 ]]
+            expected=$(awk 'NF {print $1; exit}' "$asset.sha256")
+            actual=$(sha256sum "$asset" | awk '{print $1}')
+            [[ $expected =~ ^[0-9a-fA-F]{64}$ && ${expected,,} == "$actual" ]]
+            tar -tzf "$asset" > "$listing"
+            grep -Fxq 'runtime/bin/ffmpeg' "$listing"
+            grep -Fxq 'runtime/bin/ffprobe' "$listing"
+            grep -Fxq 'runtime/runtime-manifest.txt' "$listing"
+          done
+
+      - name: Publish complete runtime set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tag=quality-runtime-latest
+          source tools/packaging/quality-runtime/versions.env
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "AV1Encode quality runtime" \
+              --notes "Pinned FFmpeg ${FFMPEG_VERSION} + VMAF runtime used by AV1Compare." \
+              --prerelease
+          fi
+
+          mkdir -p publish-assets pointers
+          targets=(linux-x86_64 linux-arm64 macos-x86_64 macos-arm64)
+          for target in "${targets[@]}"; do
+            source_asset="release-assets/av1encode-quality-runtime-${target}.tar.gz"
+            versioned="av1encode-quality-runtime-${target}-${GITHUB_SHA}.tar.gz"
+            cp -- "$source_asset" "publish-assets/$versioned"
+            sha256sum "publish-assets/$versioned" > "publish-assets/$versioned.sha256"
+            printf '%s\n' "$versioned" > "pointers/av1encode-quality-runtime-${target}.current"
+          done
+
+          gh release upload "$tag" publish-assets/* --clobber
+          gh release upload "$tag" pointers/* --clobber
+          gh release edit "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "AV1Encode quality runtime" \
+            --notes "Latest complete pinned FFmpeg ${FFMPEG_VERSION} + VMAF runtime used by AV1Compare." \
+            --prerelease
