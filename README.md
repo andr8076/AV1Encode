@@ -85,6 +85,20 @@ Inspect proven capabilities as JSON:
 ./AV1Encode.sh --machine-probe
 ```
 
+Protocol 2 lets an orchestrator submit semantic requirements and receive an
+evaluated, fingerprinted plan with sampled quality, size, and speed predictions:
+
+```bash
+./AV1Encode.sh --machine-negotiate 1,2
+./AV1Encode.sh --machine-evaluate requirements.json --plan-json plan.json
+./AV1Encode.sh --execute-plan plan.json --result-json result.json
+```
+
+The caller does not choose CRF, QP, preset, pixel format, or FFmpeg filters.
+Those remain AV1Encode policy, so a future encoder-policy improvement changes
+the implementation fingerprint, invalidates old plans, and automatically
+benefits newly evaluated Hardcore Archive jobs.
+
 Run one explicitly addressed dependency job:
 
 ```bash
@@ -96,7 +110,7 @@ Run one explicitly addressed dependency job:
     --copy-audio
 ```
 
-Machine mode requires one input file and an exact output path. It supports a
+Protocol-1 machine mode requires one input file and an exact output path. It supports a
 forced encoder through `--encoder`, performs a full video/audio decode before
 committing the output, and can preserve all streams, chapters, attachments, and
 copyable metadata in Matroska. AUTO remains hardware-only in both normal and

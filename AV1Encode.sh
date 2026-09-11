@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.2, derived from the 265Encode workflow.
+# AV1Encode 1.3, derived from the 265Encode workflow.
 # The VA-API filter chain now normalizes every frame to the input stream's initial
 # dimensions before it reaches the encoder, preventing an incompatible software
 # auto-scaler from being inserted after hwupload.
@@ -11,8 +11,9 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.2"
+SCRIPT_VERSION="1.3"
 MACHINE_INTERFACE_VERSION="1"
+LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
 
@@ -101,6 +102,13 @@ Dependency interface:
       --machine            Non-interactive single-file encoding for callers
       --machine-probe      Print the versioned encoder capability JSON and exit
       --interface-version  Print the machine-interface version and exit
+      --machine-negotiate VERSIONS
+                           Select the newest supported version from a comma-separated list
+      --machine-evaluate REQUIREMENTS.json --plan-json PLAN.json
+      --machine-plan REQUIREMENTS.json --plan-json PLAN.json
+                           Evaluate semantic protocol-v2 requirements and write a sealed plan
+      --execute-plan PLAN.json --result-json RESULT.json
+                           Validate fingerprints and execute an unchanged protocol-v2 plan
       --encoder NAME       auto, av1_vaapi, av1_nvenc, av1_qsv, or libsvtav1
       --output PATH        Exact .mp4 or .mkv destination; requires --machine
       --result-json PATH   Write an atomic machine-readable result; requires --machine
@@ -188,7 +196,7 @@ parse_arguments() {
                 exit 0
                 ;;
             --interface-version)
-                echo "$MACHINE_INTERFACE_VERSION"
+                echo "$LATEST_MACHINE_INTERFACE_VERSION"
                 exit 0
                 ;;
             -i|--input)
@@ -871,8 +879,9 @@ show_machine_capabilities() {
 
     printf '{"schema":"av1encode.capabilities","protocol_version":%s,' "$MACHINE_INTERFACE_VERSION"
     printf '"tool":{"name":"AV1Encode","version":%s},' "$(json_string "$SCRIPT_VERSION")"
+    printf '"supported_protocol_versions":[1,2],'
     printf '"codec":"av1","auto_policy":"hardware_only","ffmpeg":%s,' "$(json_string "$ffmpeg_version")"
-    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true},'
+    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true},'
     if [[ -n $auto_encoder ]]; then
         printf '"auto_encoder":%s,' "$(json_string "$auto_encoder")"
     else
@@ -1538,10 +1547,44 @@ show_plan() {
     done
 }
 
+dispatch_protocol_v2() {
+    local script_dir planner
+    script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+    planner="$script_dir/tools/AV1Plan.py"
+
+    case "${1-}" in
+        --machine-negotiate)
+            if (( $# != 2 )); then
+                error "Usage: $SCRIPT_NAME --machine-negotiate VERSION[,VERSION...]"
+                exit 2
+            fi
+            command -v python3 >/dev/null 2>&1 || { error "python3 is required for protocol v2."; exit 1; }
+            exec python3 "$planner" negotiate "$2"
+            ;;
+        --machine-evaluate|--machine-plan)
+            if (( $# != 4 )) || [[ "$3" != --plan-json ]]; then
+                error "Usage: $SCRIPT_NAME $1 REQUIREMENTS.json --plan-json PLAN.json"
+                exit 2
+            fi
+            command -v python3 >/dev/null 2>&1 || { error "python3 is required for protocol v2."; exit 1; }
+            exec python3 "$planner" evaluate "$2" "$4" "$script_dir/AV1Encode.sh"
+            ;;
+        --execute-plan)
+            if (( $# != 4 )) || [[ "$3" != --result-json ]]; then
+                error "Usage: $SCRIPT_NAME --execute-plan PLAN.json --result-json RESULT.json"
+                exit 2
+            fi
+            command -v python3 >/dev/null 2>&1 || { error "python3 is required for protocol v2."; exit 1; }
+            exec python3 "$planner" execute "$2" "$4" "$script_dir/AV1Encode.sh"
+            ;;
+    esac
+}
+
 main() {
     local file
     local failures=0
 
+    dispatch_protocol_v2 "$@"
     parse_arguments "$@"
     if [[ "$MACHINE_MODE" == yes && -n "$RESULT_JSON_PATH" ]]; then
         trap machine_exit_handler EXIT

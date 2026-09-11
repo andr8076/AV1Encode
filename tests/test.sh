@@ -5,6 +5,7 @@ IFS=$'\n\t'
 ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
 ENCODER="$ROOT/AV1Encode.sh"
 COMPARATOR="$ROOT/tools/AV1Compare.py"
+PLANNER="$ROOT/tools/AV1Plan.py"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/av1encode-tests.XXXXXX")
 cleanup() { rm -rf -- "$TEST_ROOT"; }
 trap cleanup EXIT
@@ -21,9 +22,10 @@ assert_contains() {
 
 bash -n "$ENCODER"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$COMPARATOR"
+PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$PLANNER"
 
-[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.2' ]] || fail 'unexpected encoder version'
-[[ $("$ENCODER" --interface-version) == '1' ]] || fail 'unexpected machine-interface version'
+[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3' ]] || fail 'unexpected encoder version'
+[[ $("$ENCODER" --interface-version) == '2' ]] || fail 'unexpected machine-interface version'
 [[ $(python3 "$COMPARATOR" --version) == 'AV1Compare.py 2.0' ]] || fail 'unexpected comparator version'
 help=$("$ENCODER" --help)
 assert_contains "$help" 'AV1 encoding'
@@ -33,6 +35,28 @@ assert_contains "$help" 'Automatically select a working hardware encoder'
 assert_contains "$help" '--machine-probe'
 assert_contains "$help" '--result-json'
 assert_contains "$help" '--preserve-all'
+assert_contains "$help" '--machine-negotiate'
+assert_contains "$help" '--machine-evaluate'
+assert_contains "$help" '--execute-plan'
+
+negotiation=$("$ENCODER" --machine-negotiate 1,2,3)
+python3 - "$negotiation" <<'PY'
+import json
+import sys
+report = json.loads(sys.argv[1])
+assert report["schema"] == "av1encode.negotiation"
+assert report["supported_protocol_versions"] == [1, 2]
+assert report["selected_protocol_version"] == 2
+assert report["compatible"] is True
+PY
+no_common=$("$ENCODER" --machine-negotiate 7,8)
+python3 - "$no_common" <<'PY'
+import json
+import sys
+report = json.loads(sys.argv[1])
+assert report["compatible"] is False
+assert report["selected_protocol_version"] is None
+PY
 
 if "$ENCODER" --software --crf 64 missing.mkv >"$TEST_ROOT/invalid-crf.log" 2>&1; then
     fail 'CRF 64 was accepted'
@@ -76,10 +100,13 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     report = json.load(handle)
 assert report["schema"] == "av1encode.capabilities"
 assert report["protocol_version"] == 1
+assert report["supported_protocol_versions"] == [1, 2]
 assert report["codec"] == "av1"
 assert report["auto_policy"] == "hardware_only"
 assert report["features"]["exact_output"] is True
 assert report["features"]["preserve_all"] is True
+assert report["features"]["semantic_planning"] is True
+assert report["features"]["fingerprint_invalidation"] is True
 encoders = {item["name"]: item for item in report["encoders"]}
 assert set(encoders) == {"av1_vaapi", "av1_nvenc", "av1_qsv", "libsvtav1"}
 assert encoders["libsvtav1"]["class"] == "software"
@@ -188,5 +215,131 @@ assert_contains "$skip_log" 'Skipping because AV1 skip is enabled.'
 python3 "$COMPARATOR" --no-quality "$TEST_ROOT/source.mkv" "$output" \
     >"$TEST_ROOT/compare.log"
 assert_contains "$(<"$TEST_ROOT/compare.log")" 'CANDIDATE'
+
+# Protocol v2 keeps encoder settings inside AV1Encode. The caller supplies a
+# semantic contract, receives sampled predictions, and later executes the
+# sealed plan without restating CRF/QP/preset choices.
+plan_source="$TEST_ROOT/plan-source.mkv"
+cp "$TEST_ROOT/source.mkv" "$plan_source"
+plan_output="$TEST_ROOT/planned-output.mkv"
+requirements="$TEST_ROOT/requirements.json"
+plan="$TEST_ROOT/plan.json"
+plan_result="$TEST_ROOT/plan-result.json"
+python3 - "$requirements" "$plan_source" "$plan_output" <<'PY'
+import json
+import sys
+requirements = {
+    "schema": "av1encode.requirements",
+    "protocol_version": 2,
+    "input": sys.argv[2],
+    "output": sys.argv[3],
+    "hardware_policy": "manual_software",
+    "quality": {
+        "metric": "ssim_percent",
+        "target": 90,
+        "p10_minimum": 86,
+        "sustained_floor": 84,
+        "maximum_sustained_seconds": 1,
+    },
+    "optimization": {"primary": "smallest_output", "secondary": "fastest_encoding"},
+    "video": {"maximum_height": None, "denoise": "auto"},
+    "preservation": {"streams": "all", "chapters": True, "metadata": True},
+    "audio": {"mode": "copy_all"},
+    "evaluation": {"sample_seconds": 1},
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(requirements, handle)
+PY
+python3 - "$requirements" "$TEST_ROOT/forbidden-requirements.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    requirements = json.load(handle)
+requirements["ffmpeg_args"] = ["-crf", "1"]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(requirements, handle)
+PY
+if "$ENCODER" --machine-evaluate "$TEST_ROOT/forbidden-requirements.json" \
+    --plan-json "$TEST_ROOT/forbidden-plan.json" >"$TEST_ROOT/forbidden.log" 2>&1; then
+    fail 'protocol v2 accepted caller-supplied FFmpeg arguments'
+fi
+assert_contains "$(<"$TEST_ROOT/forbidden.log")" 'Unknown requirement field(s): ffmpeg_args'
+
+"$ENCODER" --machine-evaluate "$requirements" --plan-json "$plan" >"$TEST_ROOT/plan-reference.json"
+python3 - "$plan" "$TEST_ROOT/plan-reference.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    plan = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    reference = json.load(handle)
+assert plan["schema"] == "av1encode.plan"
+assert plan["protocol_version"] == 2
+assert plan["plan_id"].startswith("av1p_")
+assert reference["plan_id"] == plan["plan_id"]
+assert plan["selection"]["encoder"] == "libsvtav1"
+assert plan["selection"]["policy_owner"] == "AV1Encode"
+assert plan["recipe"]["quality"] == {"kind": "crf", "preset": 6, "value": 30}
+assert plan["prediction"]["quality"]["metric"] == "ssim_percent"
+assert isinstance(plan["prediction"]["quality"]["predicted_score"], float)
+assert plan["prediction"]["size"]["predicted_video_bytes"] > 0
+assert plan["prediction"]["size"]["predicted_output_bytes"] >= plan["prediction"]["size"]["predicted_video_bytes"]
+assert plan["prediction"]["speed"]["predicted_encode_seconds"] > 0
+assert set(plan["fingerprints"]) == {"implementation", "runtime", "source", "requirements"}
+assert all(item["value"].startswith("sha256:") for item in plan["fingerprints"].values())
+PY
+
+"$ENCODER" --execute-plan "$plan" --result-json "$plan_result" >"$TEST_ROOT/plan-execute.log" 2>&1
+[[ -s $plan_output ]] || fail 'protocol-v2 plan did not create its output'
+python3 - "$plan_result" "$plan" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    plan = json.load(handle)
+assert result["schema"] == "av1encode.plan-result"
+assert result["protocol_version"] == 2
+assert result["plan_id"] == plan["plan_id"]
+assert result["status"] == "ok"
+assert result["executor_result"]["protocol_version"] == 1
+PY
+
+python3 - "$plan" "$TEST_ROOT/tampered-plan.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    plan = json.load(handle)
+plan["recipe"]["quality"]["value"] = 1
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(plan, handle)
+PY
+if "$ENCODER" --execute-plan "$TEST_ROOT/tampered-plan.json" \
+    --result-json "$TEST_ROOT/tampered-result.json" >"$TEST_ROOT/tampered.log" 2>&1; then
+    fail 'a modified protocol-v2 plan was executed'
+fi
+assert_contains "$(<"$TEST_ROOT/tampered.log")" 'Plan integrity check failed'
+
+printf 'changed after evaluation\n' >> "$plan_source"
+if "$ENCODER" --execute-plan "$plan" --result-json "$TEST_ROOT/stale-result.json" \
+    >"$TEST_ROOT/stale.log" 2>&1; then
+    fail 'a plan with a changed source fingerprint was executed'
+fi
+assert_contains "$(<"$TEST_ROOT/stale.log")" 'source fingerprint changed'
+
+python3 - "$PLANNER" "$plan" <<'PY'
+import copy
+import importlib.util
+import json
+import sys
+spec = importlib.util.spec_from_file_location("av1plan_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    plan = json.load(handle)
+changed = copy.deepcopy(plan)
+changed["fingerprints"]["implementation"]["value"] = "sha256:" + "0" * 64
+assert module.calculate_plan_id(changed) != plan["plan_id"]
+PY
 
 printf 'All AV1Encode tests passed.\n'
