@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-ROOT=$(cd -- "$HERE/../.." && pwd -P)
+ROOT=$(cd -- "$HERE/../../.." && pwd -P)
 # shellcheck source=/dev/null
 source "$HERE/versions.env"
 
@@ -204,4 +204,4 @@ architecture=$(uname -m)
 EOF_MANIFEST
 
 printf 'Runtime created at %s/runtime\n' "$OUT"
-printf 'Run packaging/media-runtime/smoke-test.sh %q/runtime before publishing it.\n' "$OUT"
+printf 'Run tools/packaging/quality-runtime/smoke-test.sh %q/runtime before publishing it.\n' "$OUT"
