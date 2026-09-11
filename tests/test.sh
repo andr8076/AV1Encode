@@ -22,12 +22,13 @@ assert_contains() {
 bash -n "$ENCODER"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$COMPARATOR"
 
-[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.0' ]] || fail 'unexpected encoder version'
+[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.1' ]] || fail 'unexpected encoder version'
 [[ $(python3 "$COMPARATOR" --version) == 'AV1Compare.py 2.0' ]] || fail 'unexpected comparator version'
 help=$("$ENCODER" --help)
 assert_contains "$help" 'AV1 encoding'
 assert_contains "$help" '--skip-av1'
 assert_contains "$help" 'libsvtav1 preset (0-13)'
+assert_contains "$help" 'Automatically select a working hardware encoder'
 
 if "$ENCODER" --software --crf 64 missing.mkv >"$TEST_ROOT/invalid-crf.log" 2>&1; then
     fail 'CRF 64 was accepted'
@@ -53,6 +54,31 @@ ffmpeg -hide_banner -loglevel error \
     -f lavfi -i 'sine=frequency=440:duration=1' \
     -c:v ffv1 -c:a pcm_s16le "$TEST_ROOT/source.mkv"
 
+if ENCODER="$ENCODER" bash -c '
+    source "$ENCODER"
+    MODE=auto
+    AUDIO_MODE=aac
+    detect_hw() { HW_TYPE=none; HW_DETAIL=""; }
+    configure_encoder
+' >"$TEST_ROOT/auto-without-hardware.log" 2>&1; then
+    fail 'AUTO succeeded without working AV1 hardware'
+fi
+assert_contains "$(<"$TEST_ROOT/auto-without-hardware.log")" \
+    'AUTO could not find a working hardware AV1 encoder.'
+assert_contains "$(<"$TEST_ROOT/auto-without-hardware.log")" 'CPU fallback is disabled.'
+
+# Exercise selection independently of CI hardware by replacing only the probe result.
+# This verifies that AUTO selects hardware while explicit software remains available.
+source "$ENCODER"
+MODE=auto
+AUDIO_MODE=aac
+detect_hw() { HW_TYPE=nvidia; HW_DETAIL='test NVENC'; }
+configure_encoder
+[[ $ACTIVE_MODE == hardware ]] || fail 'AUTO did not select hardware mode'
+[[ $ACTIVE_ENCODER == 'NVIDIA NVENC' ]] || fail 'AUTO did not select the proven encoder'
+[[ ${VIDEO_ENCODER_ARGS[0]} == '-c:v' && ${VIDEO_ENCODER_ARGS[1]} == av1_nvenc ]] || \
+    fail 'AUTO command is not AV1 NVENC'
+
 dry_run=$("$ENCODER" --software --crf 40 --preset 10 --container mkv --dry-run "$TEST_ROOT/source.mkv")
 assert_contains "$dry_run" '-c:v libsvtav1'
 assert_contains "$dry_run" 'source_av1.part.mkv'
@@ -66,6 +92,7 @@ output="$TEST_ROOT/source_av1.mkv"
 [[ $(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$output") == aac ]] || \
     fail 'output audio codec is not AAC'
 ffmpeg -hide_banner -loglevel error -xerror -i "$output" -map 0:V:0 -f null -
+validate_hardware_probe_output "$output" || fail 'probe output validation rejected valid AV1'
 
 skip_log=$("$ENCODER" --software --skip-av1 --container mkv "$output")
 assert_contains "$skip_log" 'Skipping because AV1 skip is enabled.'

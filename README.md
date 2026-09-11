@@ -10,8 +10,9 @@ file. A `.part` file is used until FFmpeg finishes successfully.
 
 ## Encoders
 
-AV1Encode tests hardware paths with a bounded real encode before selecting one.
-FFmpeg merely listing an encoder is not enough.
+AV1Encode tests hardware paths with a bounded real encode, checks that the result
+is AV1, and decodes it before selecting the encoder. FFmpeg merely listing an
+encoder is not enough.
 
 | Platform | FFmpeg encoder | Use |
 |---|---|---|
@@ -21,8 +22,9 @@ FFmpeg merely listing an encoder is not enough.
 | Any supported CPU | `libsvtav1` | Software |
 
 Intel Skylake/P530 has no AV1 encoding hardware, so the HEVC-only legacy Intel
-runtime from 265Encode is intentionally not included. Those machines can still
-use `--software` or AUTO's software fallback when FFmpeg provides `libsvtav1`.
+runtime from 265Encode is intentionally not included. AUTO therefore refuses to
+run on those machines. They can still encode on the CPU only when `--software`
+is supplied explicitly and FFmpeg provides `libsvtav1`.
 
 ## Requirements
 
@@ -48,9 +50,10 @@ also available:
 ./AV1Encode.sh --list-hardware --debug-hardware
 ```
 
-AUTO prefers a proven hardware encoder and falls back to SVT-AV1 software
-encoding when AV1 hardware is unavailable. Use `--hardware` when falling back to
-the CPU would be undesirable.
+AUTO selects a proven hardware encoder and never falls back to the CPU. If no
+hardware AV1 path passes the real encode, codec, and decode checks, AV1Encode
+stops with an error. CPU encoding is available only through explicit
+`--software` selection.
 
 SVT-AV1 CRF accepts 0-63; lower values preserve more quality and produce larger
 files. Its preset accepts 0-13; lower values are slower. Defaults are CRF 30 and

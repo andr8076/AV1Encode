@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.0, derived from the 265Encode workflow.
+# AV1Encode 1.1, derived from the 265Encode workflow.
 # The VA-API filter chain now normalizes every frame to the input stream's initial
 # dimensions before it reaches the encoder, preventing an incompatible software
 # auto-scaler from being inserted after hwupload.
@@ -11,7 +11,7 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
 
@@ -45,7 +45,8 @@ Usage:
   $SCRIPT_NAME [options] FILE_OR_FOLDER
   $SCRIPT_NAME [options] --input FILE_OR_FOLDER
 
-With no arguments, the script uses the original interactive menus.
+With no arguments, the script asks for the input and automatically selects a
+proven hardware AV1 encoder with its recommended settings.
 With command-line arguments, it runs non-interactively unless --interactive
 or --confirm is supplied.
 
@@ -60,8 +61,8 @@ Input and traversal:
 
 Encoding:
   -m, --mode MODE          auto, software, or hardware
-      --auto               Use hardware when available, otherwise software
-      --software           Force libsvtav1 software encoding
+      --auto               Automatically select a working hardware encoder
+      --software           Explicitly allow libsvtav1 CPU encoding
       --hardware           Require hardware AV1 encoding
       --crf NUMBER         libsvtav1 CRF (0-63), default: 30
       --preset LEVEL       libsvtav1 preset (0-13), default: 6
@@ -88,7 +89,7 @@ Operation:
       --version            Show the script version
 
 Command-line defaults:
-  mode=auto, recursive=no, common extensions, process AV1, AAC 192k,
+  mode=auto (hardware only), recursive=no, common extensions, process AV1, AAC 192k,
   container=mp4, and skip existing output files.
 
 Examples:
@@ -385,12 +386,17 @@ run_hardware_probe() {
     local output
     local status
     local command=("$@")
+    local runner=()
+
+    if command -v timeout >/dev/null 2>&1; then
+        runner=(timeout --kill-after=3 30)
+    fi
 
     debug_log "$label"
-    debug_print_command "${command[@]}"
+    debug_print_command "${runner[@]}" "${command[@]}"
 
     # Capture FFmpeg's diagnostics while keeping normal probe output quiet.
-    output="$("${command[@]}" </dev/null 2>&1 >/dev/null)"
+    output="$("${runner[@]}" "${command[@]}" </dev/null 2>&1 >/dev/null)"
     status=$?
 
     if [[ "$DEBUG_HARDWARE" == "yes" ]]; then
@@ -410,6 +416,27 @@ run_hardware_probe() {
     return "$status"
 }
 
+validate_hardware_probe_output() {
+    local output_file="$1"
+    local codec
+
+    [[ -s "$output_file" ]] || {
+        debug_log "Probe produced no output file."
+        return 1
+    }
+
+    codec="$(ffprobe -v error -select_streams V:0 \
+        -show_entries stream=codec_name -of csv=p=0 "$output_file" 2>/dev/null | head -n 1)"
+    [[ "$codec" == "av1" ]] || {
+        debug_log "Probe output codec was '${codec:-unreadable}', not AV1."
+        return 1
+    }
+
+    run_hardware_probe "Decoding and validating the AV1 probe output" \
+        ffmpeg -hide_banner -loglevel error -xerror -i "$output_file" \
+        -map 0:V:0 -f null -
+}
+
 encoder_available() {
     local encoder="$1"
 
@@ -427,39 +454,78 @@ encoder_available() {
 test_simple_encoder() {
     local encoder="$1"
     local pixel_format="$2"
+    local probe_dir
+    local probe_output
+    local status=1
+    local encoder_args=()
+
+    case "$encoder" in
+        av1_nvenc)
+            encoder_args=(-rc vbr -cq "$HARDWARE_QP" -preset slow)
+            ;;
+        av1_qsv)
+            encoder_args=(-global_quality "$HARDWARE_QP" -preset slow)
+            ;;
+        *)
+            debug_log "No production probe settings are defined for $encoder."
+            return 1
+            ;;
+    esac
+
+    probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/av1encode-hardware-probe.XXXXXX")" || return 1
+    probe_output="$probe_dir/output.mkv"
     local command=(
         ffmpeg -hide_banner -loglevel error
-        -f lavfi -i "color=black:size=${HARDWARE_PROBE_SIZE}:rate=1"
-        -frames:v 1
+        -f lavfi -i "color=black:size=${HARDWARE_PROBE_SIZE}:rate=8"
+        -frames:v 8
+        -an -sn -dn
         -c:v "$encoder"
+        "${encoder_args[@]}"
         -pix_fmt "$pixel_format"
-        -f null -
+        -f matroska "$probe_output"
     )
 
-    run_hardware_probe "Testing $encoder with $pixel_format" "${command[@]}"
+    if run_hardware_probe "Testing $encoder with $pixel_format" "${command[@]}" &&
+       validate_hardware_probe_output "$probe_output"; then
+        status=0
+    fi
+    rm -rf -- "$probe_dir"
+    return "$status"
 }
 
 test_vaapi_device() {
     local device="$1"
     local upload_format="$2"
+    local probe_dir
+    local probe_output
+    local status=1
+
+    probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/av1encode-vaapi-probe.XXXXXX")" || return 1
+    probe_output="$probe_dir/output.mkv"
     local command=(
         ffmpeg -hide_banner -loglevel error
         -init_hw_device "vaapi=va:${device}"
         -filter_hw_device va
-        -f lavfi -i "color=black:size=${HARDWARE_PROBE_SIZE}:rate=1"
-        -frames:v 1
+        -f lavfi -i "color=black:size=${HARDWARE_PROBE_SIZE}:rate=8"
+        -frames:v 8
+        -an -sn -dn
         -vf "format=${upload_format},hwupload,scale_vaapi=w=${HARDWARE_PROBE_SIZE%x*}:h=${HARDWARE_PROBE_SIZE#*x}:format=${upload_format}:mode=hq"
         -c:v av1_vaapi
-        -qp 30
-        -f null -
+        -rc_mode CQP
+        -qp "$HARDWARE_QP"
+        -f matroska "$probe_output"
     )
 
     # Do not force Main or Main10 here. The VA-API encoder chooses the profile
     # from nv12 or p010le. Forcing a profile can create false probe failures on
     # otherwise working Mesa/VA-API combinations.
-    run_hardware_probe \
+    if run_hardware_probe \
         "Testing VA-API device $device with upload format $upload_format" \
-        "${command[@]}"
+        "${command[@]}" && validate_hardware_probe_output "$probe_output"; then
+        status=0
+    fi
+    rm -rf -- "$probe_dir"
+    return "$status"
 }
 
 show_vaapi_environment() {
@@ -627,7 +693,6 @@ prompt_yes_no() {
 collect_interactive_options() {
     local ext_choice
     local ext_input
-    local mode_choice
 
     echo "--- AV1 Batch Encoder ---"
     echo
@@ -667,35 +732,10 @@ collect_interactive_options() {
         fi
     fi
 
-    detect_hw
-
     if [[ -z "$MODE" ]]; then
+        MODE="auto"
         echo
-        echo "--- Encoding Mode ---"
-        echo "1) Quality/Small Size - Software libsvtav1"
-
-        case "$HW_TYPE" in
-            nvidia) echo "2) High Speed - NVIDIA NVENC" ;;
-            intel)  echo "2) High Speed - Intel QSV" ;;
-            vaapi)
-                echo "2) High Speed - AMD/Linux VA-API"
-                echo "   Device: $VAAPI_DEVICE"
-                echo "   Mode:   ${VAAPI_BIT_DEPTH} AV1"
-                ;;
-            *) echo "2) Hardware acceleration not detected" ;;
-        esac
-
-        read -r -p "Select mode (1 or 2): " mode_choice
-        if [[ "$mode_choice" == "2" ]]; then
-            if [[ "$HW_TYPE" == "none" ]]; then
-                echo "Hardware encoding is unavailable; using software libsvtav1 instead."
-                MODE="software"
-            else
-                MODE="hardware"
-            fi
-        else
-            MODE="software"
-        fi
+        echo "Encoding mode: AUTO (hardware only; CPU fallback disabled)"
     fi
 
     if [[ -d "$INPUT_PATH" && -z "$RECURSIVE" ]]; then
@@ -738,6 +778,10 @@ configure_encoder() {
 
     # Explicit software mode never probes or downloads optional hardware support.
     if [[ "$selected_mode" == "software" ]]; then
+        if ! encoder_available "libsvtav1"; then
+            error "Software mode was requested, but FFmpeg does not provide libsvtav1."
+            exit 1
+        fi
         ACTIVE_MODE="software"
         ACTIVE_ENCODER="libsvtav1"
         VIDEO_ENCODER_ARGS=(
@@ -753,28 +797,17 @@ configure_encoder() {
 
     if [[ "$selected_mode" == "auto" ]]; then
         if [[ "$HW_TYPE" == "none" ]]; then
-            selected_mode="software"
-        else
-            selected_mode="hardware"
+            error "AUTO could not find a working hardware AV1 encoder."
+            echo "CPU fallback is disabled. Use --software only when CPU encoding is intentional." >&2
+            exit 1
         fi
+        selected_mode="hardware"
     fi
 
     if [[ "$selected_mode" == "hardware" && "$HW_TYPE" == "none" ]]; then
         error "Hardware mode was requested, but no working AV1 hardware encoder was detected."
-        echo "Use --auto to fall back automatically or --software to force libsvtav1." >&2
+        echo "CPU fallback is disabled. Use --software only when CPU encoding is intentional." >&2
         exit 1
-    fi
-
-    if [[ "$selected_mode" == "software" ]]; then
-        ACTIVE_MODE="software"
-        ACTIVE_ENCODER="libsvtav1"
-        VIDEO_ENCODER_ARGS=(
-            -c:v libsvtav1
-            -crf "$SOFTWARE_CRF"
-            -preset "$SOFTWARE_PRESET"
-            -pix_fmt yuv420p10le
-        )
-        return
     fi
 
     ACTIVE_MODE="hardware"
@@ -1141,4 +1174,6 @@ main() {
     exit 1
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
