@@ -73,6 +73,35 @@ python3 tools/AV1Compare.py --no-quality original.mkv original_av1.mkv
 If the system FFmpeg lacks `libvmaf`, the comparator can download the pinned,
 checksum-verified quality runtime published by this repository.
 
+## Dependency interface
+
+AV1Encode remains a standalone ready-to-go program, but it also exposes a
+versioned interface for programs such as Hardcore Archive. Normal users do not
+need these options.
+
+Inspect proven capabilities as JSON:
+
+```bash
+./AV1Encode.sh --machine-probe
+```
+
+Run one explicitly addressed dependency job:
+
+```bash
+./AV1Encode.sh --machine \
+    --input source.mkv \
+    --output staging/result.mkv \
+    --result-json staging/result.json \
+    --preserve-all \
+    --copy-audio
+```
+
+Machine mode requires one input file and an exact output path. It supports a
+forced encoder through `--encoder`, performs a full video/audio decode before
+committing the output, and can preserve all streams, chapters, attachments, and
+copyable metadata in Matroska. AUTO remains hardware-only in both normal and
+machine operation. See `docs/dependency-interface.md` for the protocol.
+
 ## Test
 
 ```bash

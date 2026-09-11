@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.1, derived from the 265Encode workflow.
+# AV1Encode 1.2, derived from the 265Encode workflow.
 # The VA-API filter chain now normalizes every frame to the input stream's initial
 # dimensions before it reaches the encoder, preventing an incompatible software
 # auto-scaler from being inserted after hwupload.
@@ -11,7 +11,8 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
+MACHINE_INTERFACE_VERSION="1"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
 
@@ -28,6 +29,12 @@ START_CONFIRM=""
 DRY_RUN="no"
 LIST_HARDWARE_ONLY="no"
 DEBUG_HARDWARE="no"
+MACHINE_MODE="no"
+MACHINE_ACTION="encode"
+FORCED_ENCODER="auto"
+OUTPUT_PATH_OVERRIDE=""
+RESULT_JSON_PATH=""
+PRESERVE_ALL_STREAMS="no"
 SOFTWARE_CRF="30"
 SOFTWARE_PRESET="6"
 HARDWARE_QP="24"
@@ -37,6 +44,10 @@ OUTPUT_EXTENSION="mp4"
 VAAPI_DEVICE_OVERRIDE=""
 ALLOWED_EXTENSIONS=()
 FILES=()
+ACTIVE_ENCODER_ID=""
+LAST_OUTPUT_FILE=""
+LAST_RESULT_STATUS="not_started"
+MACHINE_RESULT_WRITTEN="no"
 
 usage() {
     cat <<EOF_USAGE
@@ -85,6 +96,16 @@ Operation:
       --dry-run            Show FFmpeg commands without running them
       --list-hardware      Detect and display the available AV1 path
       --debug-hardware     Show hardware probe commands and full errors
+
+Dependency interface:
+      --machine            Non-interactive single-file encoding for callers
+      --machine-probe      Print the versioned encoder capability JSON and exit
+      --interface-version  Print the machine-interface version and exit
+      --encoder NAME       auto, av1_vaapi, av1_nvenc, av1_qsv, or libsvtav1
+      --output PATH        Exact .mp4 or .mkv destination; requires --machine
+      --result-json PATH   Write an atomic machine-readable result; requires --machine
+      --preserve-all       Preserve all streams, chapters, and metadata in MKV;
+                           requires --machine and --copy-audio is recommended
   -h, --help               Show this help
       --version            Show the script version
 
@@ -164,6 +185,10 @@ parse_arguments() {
                 ;;
             --version)
                 echo "$SCRIPT_NAME $SCRIPT_VERSION"
+                exit 0
+                ;;
+            --interface-version)
+                echo "$MACHINE_INTERFACE_VERSION"
                 exit 0
                 ;;
             -i|--input)
@@ -284,6 +309,39 @@ parse_arguments() {
                 DEBUG_HARDWARE="yes"
                 shift
                 ;;
+            --machine)
+                MACHINE_MODE="yes"
+                MACHINE_ACTION="encode"
+                INTERACTIVE_MODE="no"
+                START_CONFIRM="no"
+                shift
+                ;;
+            --machine-probe)
+                MACHINE_MODE="yes"
+                MACHINE_ACTION="probe"
+                INTERACTIVE_MODE="no"
+                START_CONFIRM="no"
+                shift
+                ;;
+            --encoder)
+                require_value "$1" "${2-}"
+                FORCED_ENCODER="${2,,}"
+                shift 2
+                ;;
+            --output)
+                require_value "$1" "${2-}"
+                OUTPUT_PATH_OVERRIDE="$2"
+                shift 2
+                ;;
+            --result-json)
+                require_value "$1" "${2-}"
+                RESULT_JSON_PATH="$2"
+                shift 2
+                ;;
+            --preserve-all)
+                PRESERVE_ALL_STREAMS="yes"
+                shift
+                ;;
             --)
                 shift
                 while (( $# > 0 )); do
@@ -343,6 +401,59 @@ validate_options() {
             exit 2
             ;;
     esac
+
+    case "$FORCED_ENCODER" in
+        auto|av1_vaapi|av1_nvenc|av1_qsv|libsvtav1) ;;
+        *)
+            error "Invalid --encoder '$FORCED_ENCODER'."
+            exit 2
+            ;;
+    esac
+
+    if [[ "$MACHINE_MODE" != "yes" && ( -n "$OUTPUT_PATH_OVERRIDE" || -n "$RESULT_JSON_PATH" ) ]]; then
+        error "--output and --result-json require --machine."
+        exit 2
+    fi
+
+    if [[ "$PRESERVE_ALL_STREAMS" == yes && "$MACHINE_MODE" != yes ]]; then
+        error "--preserve-all requires --machine."
+        exit 2
+    fi
+
+    if [[ "$MACHINE_MODE" == "yes" && "$INTERACTIVE_MODE" == "yes" ]]; then
+        error "--machine cannot be combined with --interactive."
+        exit 2
+    fi
+
+    if [[ "$MACHINE_MODE" == "yes" && "$DRY_RUN" == "yes" ]]; then
+        error "--machine cannot be combined with --dry-run."
+        exit 2
+    fi
+
+    if [[ "$MACHINE_ACTION" == probe && -n "$RESULT_JSON_PATH" ]]; then
+        error "--result-json is used with --machine encoding, not --machine-probe."
+        exit 2
+    fi
+
+    if [[ -n "$OUTPUT_PATH_OVERRIDE" ]]; then
+        case "${OUTPUT_PATH_OVERRIDE##*.}" in
+            mp4|MP4) OUTPUT_EXTENSION="mp4" ;;
+            mkv|MKV) OUTPUT_EXTENSION="mkv" ;;
+            *)
+                error "--output must end in .mp4 or .mkv."
+                exit 2
+                ;;
+        esac
+        if [[ ! -d $(dirname -- "$OUTPUT_PATH_OVERRIDE") ]]; then
+            error "Output directory does not exist: $(dirname -- "$OUTPUT_PATH_OVERRIDE")"
+            exit 2
+        fi
+    fi
+
+    if [[ "$PRESERVE_ALL_STREAMS" == yes && "$OUTPUT_EXTENSION" != mkv ]]; then
+        error "--preserve-all requires an .mkv output."
+        exit 2
+    fi
 
     if [[ -n "$VAAPI_DEVICE_OVERRIDE" && ! -e "$VAAPI_DEVICE_OVERRIDE" ]]; then
         error "VA-API device does not exist: $VAAPI_DEVICE_OVERRIDE"
@@ -493,6 +604,28 @@ test_simple_encoder() {
     return "$status"
 }
 
+test_software_encoder() {
+    local probe_dir probe_output status=1
+    local command=()
+
+    probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/av1encode-software-probe.XXXXXX")" || return 1
+    probe_output="$probe_dir/output.mkv"
+    command=(
+        ffmpeg -hide_banner -loglevel error
+        -f lavfi -i "color=black:size=${HARDWARE_PROBE_SIZE}:rate=8"
+        -frames:v 8 -an -sn -dn
+        -c:v libsvtav1 -crf 45 -preset 13 -pix_fmt yuv420p
+        -f matroska "$probe_output"
+    )
+
+    if run_hardware_probe "Testing manual-only libsvtav1" "${command[@]}" &&
+       validate_hardware_probe_output "$probe_output"; then
+        status=0
+    fi
+    rm -rf -- "$probe_dir"
+    return "$status"
+}
+
 test_vaapi_device() {
     local device="$1"
     local upload_format="$2"
@@ -614,6 +747,146 @@ configure_vaapi() {
     return 1
 }
 
+json_string() {
+    local value="${1-}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '"%s"' "$value"
+}
+
+portable_file_size() {
+    local path="$1" size
+    size=$(stat -c '%s' -- "$path" 2>/dev/null || true)
+    [[ $size =~ ^[0-9]+$ ]] || size=$(stat -f '%z' -- "$path" 2>/dev/null || true)
+    [[ $size =~ ^[0-9]+$ ]] || size=0
+    printf '%s' "$size"
+}
+
+write_machine_result() {
+    local status="$1" exit_code="$2" result_dir temporary bytes=0 encoder_class=""
+    [[ "$MACHINE_MODE" == yes && -n "$RESULT_JSON_PATH" ]] || return 0
+    [[ "$MACHINE_RESULT_WRITTEN" != yes ]] || return 0
+
+    result_dir=$(dirname -- "$RESULT_JSON_PATH")
+    [[ -d $result_dir ]] || {
+        error "Result directory does not exist: $result_dir"
+        return 1
+    }
+    if [[ -n "$LAST_OUTPUT_FILE" && -s "$LAST_OUTPUT_FILE" ]]; then
+        bytes=$(portable_file_size "$LAST_OUTPUT_FILE")
+    fi
+    [[ "$ACTIVE_ENCODER_ID" == libsvtav1 ]] && encoder_class=software
+    [[ -n "$ACTIVE_ENCODER_ID" && "$ACTIVE_ENCODER_ID" != libsvtav1 ]] && encoder_class=hardware
+
+    temporary=$(mktemp "${RESULT_JSON_PATH}.XXXXXX") || return 1
+    {
+        printf '{"schema":"av1encode.result","protocol_version":%s,' "$MACHINE_INTERFACE_VERSION"
+        printf '"tool":{"name":"AV1Encode","version":%s},' "$(json_string "$SCRIPT_VERSION")"
+        printf '"codec":"av1","status":%s,"exit_code":%s,' "$(json_string "$status")" "$exit_code"
+        printf '"input":%s,"output":%s,' "$(json_string "$INPUT_PATH")" "$(json_string "$LAST_OUTPUT_FILE")"
+        if [[ -n "$ACTIVE_ENCODER_ID" ]]; then
+            printf '"encoder":%s,"encoder_class":%s,' \
+                "$(json_string "$ACTIVE_ENCODER_ID")" "$(json_string "$encoder_class")"
+        else
+            printf '"encoder":null,"encoder_class":null,'
+        fi
+        printf '"auto_policy":"hardware_only","preserve_all":%s,"output_bytes":%s}\n' \
+            "$([[ $PRESERVE_ALL_STREAMS == yes ]] && printf true || printf false)" "$bytes"
+    } > "$temporary" || { rm -f -- "$temporary"; return 1; }
+    mv -f -- "$temporary" "$RESULT_JSON_PATH" || { rm -f -- "$temporary"; return 1; }
+    MACHINE_RESULT_WRITTEN=yes
+}
+
+machine_exit_handler() {
+    local exit_code=$?
+    if [[ "$MACHINE_RESULT_WRITTEN" != yes ]]; then
+        write_machine_result failed "$exit_code" || true
+    fi
+}
+
+machine_probe_encoder() {
+    local encoder="$1"
+    MACHINE_PROBE_ADVERTISED=false
+    MACHINE_PROBE_USABLE=false
+    MACHINE_PROBE_DETAIL=""
+
+    if encoder_available "$encoder"; then
+        MACHINE_PROBE_ADVERTISED=true
+    fi
+
+    case "$encoder" in
+        av1_vaapi)
+            if configure_vaapi; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="${VAAPI_DEVICE}, ${VAAPI_BIT_DEPTH}"
+            fi
+            ;;
+        av1_nvenc)
+            if [[ "$MACHINE_PROBE_ADVERTISED" == true ]] && test_simple_encoder av1_nvenc p010le; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="NVIDIA NVENC"
+            fi
+            ;;
+        av1_qsv)
+            if [[ "$MACHINE_PROBE_ADVERTISED" == true ]] && test_simple_encoder av1_qsv p010le; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="Intel Quick Sync"
+            fi
+            ;;
+        libsvtav1)
+            if [[ "$MACHINE_PROBE_ADVERTISED" == true ]] && test_software_encoder; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="SVT-AV1 software encoder"
+            fi
+            ;;
+    esac
+}
+
+machine_encoder_json() {
+    local name="$1" class="$2" advertised="$3" usable="$4" detail="$5"
+    printf '{"name":%s,"class":%s,"auto_eligible":%s,"advertised":%s,"usable":%s,"detail":%s}' \
+        "$(json_string "$name")" "$(json_string "$class")" \
+        "$([[ $class == hardware ]] && printf true || printf false)" \
+        "$advertised" "$usable" "$(json_string "$detail")"
+}
+
+show_machine_capabilities() {
+    local ffmpeg_version auto_encoder="" first=true encoder class record
+    local -a records=()
+
+    ffmpeg_version=$(ffmpeg -hide_banner -version 2>/dev/null | head -n 1)
+    for encoder in av1_vaapi av1_nvenc av1_qsv libsvtav1; do
+        machine_probe_encoder "$encoder"
+        class=hardware
+        [[ $encoder == libsvtav1 ]] && class=software
+        records+=("$(machine_encoder_json "$encoder" "$class" "$MACHINE_PROBE_ADVERTISED" \
+            "$MACHINE_PROBE_USABLE" "$MACHINE_PROBE_DETAIL")")
+        if [[ -z $auto_encoder && $class == hardware && $MACHINE_PROBE_USABLE == true ]]; then
+            auto_encoder=$encoder
+        fi
+    done
+
+    printf '{"schema":"av1encode.capabilities","protocol_version":%s,' "$MACHINE_INTERFACE_VERSION"
+    printf '"tool":{"name":"AV1Encode","version":%s},' "$(json_string "$SCRIPT_VERSION")"
+    printf '"codec":"av1","auto_policy":"hardware_only","ffmpeg":%s,' "$(json_string "$ffmpeg_version")"
+    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true},'
+    if [[ -n $auto_encoder ]]; then
+        printf '"auto_encoder":%s,' "$(json_string "$auto_encoder")"
+    else
+        printf '"auto_encoder":null,'
+    fi
+    printf '"encoders":['
+    for record in "${records[@]}"; do
+        [[ $first == true ]] || printf ','
+        first=false
+        printf '%s' "$record"
+    done
+    printf ']}\n'
+}
+
 detect_hw() {
     HW_TYPE="none"
     HW_DETAIL=""
@@ -630,6 +903,31 @@ detect_hw() {
         HW_TYPE="intel"
         HW_DETAIL="Intel Quick Sync"
     fi
+}
+
+detect_forced_hardware() {
+    HW_TYPE="none"
+    HW_DETAIL=""
+    case "$FORCED_ENCODER" in
+        av1_vaapi)
+            if configure_vaapi; then
+                HW_TYPE="vaapi"
+                HW_DETAIL="${VAAPI_DEVICE}, ${VAAPI_BIT_DEPTH} AV1"
+            fi
+            ;;
+        av1_nvenc)
+            if encoder_available av1_nvenc && test_simple_encoder av1_nvenc p010le; then
+                HW_TYPE="nvidia"
+                HW_DETAIL="NVIDIA NVENC"
+            fi
+            ;;
+        av1_qsv)
+            if encoder_available av1_qsv && test_simple_encoder av1_qsv p010le; then
+                HW_TYPE="intel"
+                HW_DETAIL="Intel Quick Sync"
+            fi
+            ;;
+    esac
 }
 
 show_hardware() {
@@ -776,24 +1074,39 @@ configure_encoder() {
         AUDIO_ARGS=(-c:a aac -b:a "$AUDIO_BITRATE" -ar 48000)
     fi
 
-    # Explicit software mode never probes or downloads optional hardware support.
+    if [[ "$FORCED_ENCODER" == libsvtav1 ]]; then
+        selected_mode=software
+    elif [[ "$FORCED_ENCODER" != auto ]]; then
+        selected_mode=hardware
+    fi
+
+    # Software is available only through an explicit mode or encoder request.
     if [[ "$selected_mode" == "software" ]]; then
-        if ! encoder_available "libsvtav1"; then
-            error "Software mode was requested, but FFmpeg does not provide libsvtav1."
+        if [[ "$FORCED_ENCODER" != auto && "$FORCED_ENCODER" != libsvtav1 ]]; then
+            error "--software cannot be combined with hardware encoder '$FORCED_ENCODER'."
+            exit 2
+        fi
+        if ! encoder_available "libsvtav1" || ! test_software_encoder; then
+            error "Software mode was requested, but libsvtav1 failed its capability probe."
             exit 1
         fi
         ACTIVE_MODE="software"
         ACTIVE_ENCODER="libsvtav1"
+        ACTIVE_ENCODER_ID="libsvtav1"
         VIDEO_ENCODER_ARGS=(
-            -c:v libsvtav1
-            -crf "$SOFTWARE_CRF"
-            -preset "$SOFTWARE_PRESET"
-            -pix_fmt yuv420p10le
+            -c:v:0 libsvtav1
+            -crf:v:0 "$SOFTWARE_CRF"
+            -preset:v:0 "$SOFTWARE_PRESET"
+            -pix_fmt:v:0 yuv420p10le
         )
         return
     fi
 
-    detect_hw
+    if [[ "$FORCED_ENCODER" == auto ]]; then
+        detect_hw
+    else
+        detect_forced_hardware
+    fi
 
     if [[ "$selected_mode" == "auto" ]]; then
         if [[ "$HW_TYPE" == "none" ]]; then
@@ -805,7 +1118,11 @@ configure_encoder() {
     fi
 
     if [[ "$selected_mode" == "hardware" && "$HW_TYPE" == "none" ]]; then
-        error "Hardware mode was requested, but no working AV1 hardware encoder was detected."
+        if [[ "$FORCED_ENCODER" == auto ]]; then
+            error "Hardware mode was requested, but no working AV1 hardware encoder was detected."
+        else
+            error "Requested encoder '$FORCED_ENCODER' failed its capability probe."
+        fi
         echo "CPU fallback is disabled. Use --software only when CPU encoding is intentional." >&2
         exit 1
     fi
@@ -815,25 +1132,28 @@ configure_encoder() {
     case "$HW_TYPE" in
         nvidia)
             ACTIVE_ENCODER="NVIDIA NVENC"
+            ACTIVE_ENCODER_ID="av1_nvenc"
             VIDEO_ENCODER_ARGS=(
-                -c:v av1_nvenc
-                -rc vbr
-                -cq "$HARDWARE_QP"
-                -preset slow
-                -pix_fmt yuv420p10le
+                -c:v:0 av1_nvenc
+                -rc:v:0 vbr
+                -cq:v:0 "$HARDWARE_QP"
+                -preset:v:0 slow
+                -pix_fmt:v:0 yuv420p10le
             )
             ;;
         intel)
             ACTIVE_ENCODER="Intel Quick Sync"
+            ACTIVE_ENCODER_ID="av1_qsv"
             VIDEO_ENCODER_ARGS=(
-                -c:v av1_qsv
-                -global_quality "$HARDWARE_QP"
-                -preset slow
-                -pix_fmt yuv420p10le
+                -c:v:0 av1_qsv
+                -global_quality:v:0 "$HARDWARE_QP"
+                -preset:v:0 slow
+                -pix_fmt:v:0 yuv420p10le
             )
             ;;
         vaapi)
             ACTIVE_ENCODER="AMD/Linux VA-API"
+            ACTIVE_ENCODER_ID="av1_vaapi"
             FFMPEG_GLOBAL_ARGS=(
                 -init_hw_device "vaapi=va:${VAAPI_DEVICE}"
                 -filter_hw_device va
@@ -842,9 +1162,9 @@ configure_encoder() {
             # stream's initial width, height, and sample aspect ratio.
             VIDEO_FILTER_ARGS=()
             VIDEO_ENCODER_ARGS=(
-                -c:v av1_vaapi
-                -rc_mode CQP
-                -qp "$HARDWARE_QP"
+                -c:v:0 av1_vaapi
+                -rc_mode:v:0 CQP
+                -qp:v:0 "$HARDWARE_QP"
             )
             ;;
         *)
@@ -873,6 +1193,7 @@ analyze_video() {
     if [[ -z "$current_codec" || ! "$current_width" =~ ^[0-9]+$ ||
           ! "$current_height" =~ ^[0-9]+$ ]]; then
         echo "Skipping: could not read the first video stream."
+        LAST_RESULT_STATUS="skipped"
         return 1
     fi
 
@@ -893,6 +1214,7 @@ analyze_video() {
         echo "Warning: already AV1."
         if [[ "$SKIP_AV1" == "yes" ]]; then
             echo "Skipping because AV1 skip is enabled."
+            LAST_RESULT_STATUS="skipped"
             return 1
         fi
     fi
@@ -916,7 +1238,7 @@ build_file_video_filter() {
         sar_for_filter="${INPUT_VIDEO_SAR/:/\/}"
 
         VIDEO_FILTER_ARGS=(
-            -vf
+            -filter:v:0
             "format=${VAAPI_UPLOAD_FORMAT},hwupload,scale_vaapi=w=${INPUT_VIDEO_WIDTH}:h=${INPUT_VIDEO_HEIGHT}:format=${VAAPI_UPLOAD_FORMAT}:mode=hq,setsar=sar=${sar_for_filter}"
         )
 
@@ -942,6 +1264,50 @@ print_command() {
     printf '\n'
 }
 
+stream_count_for_file() {
+    local selector="$1" path="$2"
+    ffprobe -v error -select_streams "$selector" -show_entries stream=index -of csv=p=0 "$path" 2>/dev/null |
+        awk 'NF {count++} END {print count+0}'
+}
+
+validate_machine_output() {
+    local source="$1" candidate="$2" codec source_duration output_duration difference selector
+
+    codec=$(ffprobe -v error -select_streams V:0 -show_entries stream=codec_name \
+        -of csv=p=0 "$candidate" 2>/dev/null | head -n 1)
+    [[ $codec == av1 ]] || {
+        error "Machine output codec was '${codec:-unreadable}', not AV1."
+        return 1
+    }
+
+    source_duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$source" 2>/dev/null | head -n 1)
+    output_duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$candidate" 2>/dev/null | head -n 1)
+    if [[ $source_duration =~ ^[0-9]+([.][0-9]+)?$ && $output_duration =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        difference=$(LC_NUMERIC=C awk -v a="$source_duration" -v b="$output_duration" \
+            'BEGIN {d=a-b; if(d<0)d=-d; printf "%.6f",d}')
+        LC_NUMERIC=C awk -v d="$difference" 'BEGIN {exit !(d<=2.0)}' || {
+            error "Machine output duration differs from the input by more than two seconds."
+            return 1
+        }
+    fi
+
+    if ! ffmpeg -hide_banner -loglevel error -xerror -nostdin -i "$candidate" \
+        -map 0:V:0 -map '0:a?' -f null -; then
+        error "Machine output failed full video/audio decode validation."
+        return 1
+    fi
+
+    if [[ $PRESERVE_ALL_STREAMS == yes ]]; then
+        for selector in v a s d t; do
+            if [[ $(stream_count_for_file "$selector" "$source") != \
+                  $(stream_count_for_file "$selector" "$candidate") ]]; then
+                error "Machine output did not preserve every '$selector' stream."
+                return 1
+            fi
+        done
+    fi
+}
+
 encode_file() {
     local input_file="$1"
     local output_file="${input_file%.*}_av1.${OUTPUT_EXTENSION}"
@@ -950,8 +1316,19 @@ encode_file() {
     local overwrite_answer
     local output_args=()
     local command=()
+    local stream_map_args=(-map 0:v:0 -map '0:a:0?')
+    local stream_copy_args=()
+    local primary_rows all_video_rows stream_index
+    local -A primary_indexes=()
 
     VIDEO_OUTPUT_ARGS=()
+    LAST_RESULT_STATUS="running"
+
+    if [[ -n "$OUTPUT_PATH_OVERRIDE" ]]; then
+        output_file="$OUTPUT_PATH_OVERRIDE"
+        temporary_output="$(dirname -- "$output_file")/.${output_file##*/}.part.$$.${OUTPUT_EXTENSION}"
+    fi
+    LAST_OUTPUT_FILE="$output_file"
 
     echo
     echo "=========================================="
@@ -972,6 +1349,7 @@ encode_file() {
                 ;;
             *)
                 echo "Output exists; skipped: $output_file"
+                LAST_RESULT_STATUS="skipped"
                 return 0
                 ;;
         esac
@@ -984,6 +1362,7 @@ encode_file() {
         echo "Removing stale partial output: $temporary_output"
         if ! rm -f -- "$temporary_output"; then
             error "Could not remove stale partial output: $temporary_output"
+            LAST_RESULT_STATUS="failed"
             return 1
         fi
     fi
@@ -992,16 +1371,44 @@ encode_file() {
         output_args=(-movflags +faststart)
     fi
 
+    if [[ "$PRESERVE_ALL_STREAMS" == yes ]]; then
+        stream_map_args=()
+        primary_rows=$(ffprobe -v error -select_streams V -show_entries stream=index \
+            -of csv=p=0 "$input_file") || return 1
+        all_video_rows=$(ffprobe -v error -select_streams v -show_entries stream=index \
+            -of csv=p=0 "$input_file") || return 1
+        while IFS= read -r stream_index; do
+            [[ $stream_index =~ ^[0-9]+$ ]] || continue
+            primary_indexes[$stream_index]=1
+            stream_map_args+=(-map "0:$stream_index")
+        done <<< "$primary_rows"
+        ((${#stream_map_args[@]} > 0)) || {
+            error "No primary video stream is available for encoding."
+            LAST_RESULT_STATUS="failed"
+            return 1
+        }
+        while IFS= read -r stream_index; do
+            [[ $stream_index =~ ^[0-9]+$ ]] || continue
+            [[ -n ${primary_indexes[$stream_index]:-} ]] && continue
+            stream_map_args+=(-map "0:$stream_index")
+        done <<< "$all_video_rows"
+        stream_map_args+=(
+            -map '0:a?' -map '0:s?' -map '0:d?' -map '0:t?'
+            -map_metadata 0 -map_chapters 0 -copy_unknown
+        )
+        stream_copy_args=(-c:v copy -c:s copy -c:d copy -c:t copy -max_muxing_queue_size 4096)
+    fi
+
     command=(
         "${FFMPEG_COMMAND[@]}"
         -hide_banner
         -y
         "${FFMPEG_GLOBAL_ARGS[@]}"
         -i "$input_file"
-        -map 0:v:0
-        -map '0:a:0?'
+        "${stream_map_args[@]}"
         "${VIDEO_FILTER_ARGS[@]}"
         "${VIDEO_OUTPUT_ARGS[@]}"
+        "${stream_copy_args[@]}"
         "${VIDEO_ENCODER_ARGS[@]}"
         "${AUDIO_ARGS[@]}"
         "${output_args[@]}"
@@ -1025,22 +1432,33 @@ encode_file() {
     if [[ $ffmpeg_status -eq 0 ]]; then
         if [[ ! -s "$temporary_output" ]]; then
             error "FFmpeg reported success, but no output file was created."
+            LAST_RESULT_STATUS="failed"
+            return 1
+        fi
+
+        if [[ "$MACHINE_MODE" == yes ]] && ! validate_machine_output "$input_file" "$temporary_output"; then
+            error "Encoded output failed dependency-interface validation."
+            rm -f -- "$temporary_output"
+            LAST_RESULT_STATUS="failed"
             return 1
         fi
 
         if ! mv -f -- "$temporary_output" "$output_file"; then
             error "Encoding succeeded, but the completed file could not be moved into place."
             echo "Completed temporary file: $temporary_output" >&2
+            LAST_RESULT_STATUS="failed"
             return 1
         fi
 
         echo "Done: $output_file"
+        LAST_RESULT_STATUS="ok"
     else
         echo "Error while encoding: $input_file"
         echo "FFmpeg exit code: $ffmpeg_status"
         if [[ -e "$temporary_output" ]]; then
             echo "Partial output kept as: $temporary_output"
         fi
+        LAST_RESULT_STATUS="failed"
         return "$ffmpeg_status"
     fi
 }
@@ -1125,8 +1543,16 @@ main() {
     local failures=0
 
     parse_arguments "$@"
+    if [[ "$MACHINE_MODE" == yes && -n "$RESULT_JSON_PATH" ]]; then
+        trap machine_exit_handler EXIT
+    fi
     validate_options
     check_dependencies
+
+    if [[ "$MACHINE_ACTION" == probe ]]; then
+        show_machine_capabilities
+        exit 0
+    fi
 
     if [[ "$LIST_HARDWARE_ONLY" == "yes" ]]; then
         show_hardware
@@ -1140,8 +1566,25 @@ main() {
     fi
 
     validate_options
-    configure_encoder
     collect_input_files
+
+    if [[ "$MACHINE_MODE" == yes ]]; then
+        [[ -f "$INPUT_PATH" ]] || {
+            error "--machine requires one input file, not a directory."
+            exit 2
+        }
+        [[ -n "$OUTPUT_PATH_OVERRIDE" ]] || {
+            error "--machine requires --output."
+            exit 2
+        }
+        if [[ $(cd -- "$(dirname -- "$INPUT_PATH")" && pwd -P)/$(basename -- "$INPUT_PATH") == \
+              $(cd -- "$(dirname -- "$OUTPUT_PATH_OVERRIDE")" && pwd -P)/$(basename -- "$OUTPUT_PATH_OVERRIDE") ]]; then
+            error "Machine output must not replace the input file."
+            exit 2
+        fi
+    fi
+
+    configure_encoder
 
     if [[ ${#FILES[@]} -eq 0 ]]; then
         echo "No matching video files found."
@@ -1167,10 +1610,15 @@ main() {
     echo
     if (( failures == 0 )); then
         echo "All done."
+        write_machine_result "$LAST_RESULT_STATUS" 0 || {
+            error "Could not write machine result: $RESULT_JSON_PATH"
+            exit 1
+        }
         exit 0
     fi
 
     echo "Finished with $failures failed file(s)."
+    write_machine_result failed 1 || error "Could not write machine result: $RESULT_JSON_PATH"
     exit 1
 }
 
