@@ -24,7 +24,7 @@ bash -n "$ENCODER"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$COMPARATOR"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$PLANNER"
 
-[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.1' ]] || fail 'unexpected encoder version'
+[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.2' ]] || fail 'unexpected encoder version'
 [[ $("$ENCODER" --interface-version) == '2' ]] || fail 'unexpected machine-interface version'
 [[ $(python3 "$COMPARATOR" --version) == 'AV1Compare.py 2.0' ]] || fail 'unexpected comparator version'
 help=$("$ENCODER" --help)
@@ -149,8 +149,8 @@ detect_forced_hardware() {
 }
 configure_encoder
 [[ ${VIDEO_ENCODER_ARGS[2]} == -rc_mode && ${VIDEO_ENCODER_ARGS[3]} == CQP && \
-   ${VIDEO_ENCODER_ARGS[4]} == -qp && ${VIDEO_ENCODER_ARGS[5]} == 24 ]] || \
-    fail 'VA-API private quality options are not using FFmpeg-compatible unscoped names'
+   ${VIDEO_ENCODER_ARGS[4]} == -global_quality && ${VIDEO_ENCODER_ARGS[5]} == 24 ]] || \
+    fail 'VA-API quality options are not using FFmpeg-compatible unscoped names'
 
 dry_run=$("$ENCODER" --software --crf 40 --preset 10 --container mkv --dry-run "$TEST_ROOT/source.mkv")
 assert_contains "$dry_run" '-c:v:0 libsvtav1'

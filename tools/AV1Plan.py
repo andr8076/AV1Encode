@@ -340,7 +340,10 @@ def encode_sample(source: Path, destination: Path, encoder: str, recipe: dict[st
             f"format={upload},hwupload,scale_vaapi=w={recipe['source_width']}:"
             f"h={recipe['source_height']}:format={upload}:mode=hq"
         )
-        args += ["-vf", frame_filter, "-c:v", "av1_vaapi", "-rc_mode", "CQP", "-qp", str(quality["value"])]
+        args += [
+            "-vf", frame_filter, "-c:v", "av1_vaapi", "-rc_mode", "CQP",
+            "-global_quality", str(quality["value"]),
+        ]
     else:
         raise PlanError(f"No sample recipe exists for encoder: {encoder}")
     args += ["-f", "matroska", str(destination)]
