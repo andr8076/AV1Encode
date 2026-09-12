@@ -24,7 +24,7 @@ bash -n "$ENCODER"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$COMPARATOR"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$PLANNER"
 
-[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.3' ]] || fail 'unexpected encoder version'
+[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.4' ]] || fail 'unexpected encoder version'
 [[ $("$ENCODER" --interface-version) == '2' ]] || fail 'unexpected machine-interface version'
 [[ $(python3 "$COMPARATOR" --version) == 'AV1Compare.py 2.0' ]] || fail 'unexpected comparator version'
 python3 - "$COMPARATOR" "$TEST_ROOT" <<'PY'
@@ -106,7 +106,7 @@ ffmpeg -hide_banner -loglevel error \
     -f srt -i "$TEST_ROOT/subtitle.srt" \
     -f ffmetadata -i "$TEST_ROOT/chapters.ffmeta" \
     -map 0:v:0 -map 1:a:0 -map 2:a:0 -map 3:s:0 -map_chapters 4 \
-    -c:v ffv1 -c:a pcm_s16le -c:s srt \
+    -c:v ffv1 -chroma_sample_location left -c:a pcm_s16le -c:s srt \
     -attach "$TEST_ROOT/attachment.txt" -metadata:s:t mimetype=text/plain \
     "$TEST_ROOT/source.mkv"
 
@@ -213,6 +213,8 @@ assert report["output_bytes"] == os.path.getsize(sys.argv[2])
 PY
 [[ $(ffprobe -v error -select_streams V:0 -show_entries stream=codec_name -of csv=p=0 "$machine_output") == av1 ]] || \
     fail 'machine output video codec is not AV1'
+[[ $(ffprobe -v error -select_streams V:0 -show_entries stream=chroma_location -of csv=p=0 "$machine_output") == left ]] || \
+    fail 'machine output did not preserve primary video chroma location'
 for selector in v a s t; do
     source_count=$(ffprobe -v error -select_streams "$selector" -show_entries stream=index -of csv=p=0 "$TEST_ROOT/source.mkv" | sed '/^$/d' | wc -l)
     output_count=$(ffprobe -v error -select_streams "$selector" -show_entries stream=index -of csv=p=0 "$machine_output" | sed '/^$/d' | wc -l)

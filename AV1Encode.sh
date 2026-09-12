@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.3.3, derived from the 265Encode workflow.
+# AV1Encode 1.3.4, derived from the 265Encode workflow.
 # The VA-API filter chain now normalizes every frame to the input stream's initial
 # dimensions before it reaches the encoder, preventing an incompatible software
 # auto-scaler from being inserted after hwupload.
@@ -11,7 +11,7 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 MACHINE_INTERFACE_VERSION="1"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
@@ -1192,6 +1192,7 @@ analyze_video() {
     local current_width
     local current_height
     local current_sar
+    local current_chroma current_range current_space current_transfer current_primaries
 
     video_info="$(ffprobe -v error \
         -select_streams v:0 \
@@ -1200,6 +1201,16 @@ analyze_video() {
         "$input_file")"
 
     IFS=',' read -r current_codec current_width current_height current_sar <<< "$video_info"
+    current_chroma=$(ffprobe -v error -select_streams v:0 -show_entries stream=chroma_location \
+        -of default=nw=1:nk=1 "$input_file" | head -n 1)
+    current_range=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_range \
+        -of default=nw=1:nk=1 "$input_file" | head -n 1)
+    current_space=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_space \
+        -of default=nw=1:nk=1 "$input_file" | head -n 1)
+    current_transfer=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer \
+        -of default=nw=1:nk=1 "$input_file" | head -n 1)
+    current_primaries=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_primaries \
+        -of default=nw=1:nk=1 "$input_file" | head -n 1)
 
     if [[ -z "$current_codec" || ! "$current_width" =~ ^[0-9]+$ ||
           ! "$current_height" =~ ^[0-9]+$ ]]; then
@@ -1216,6 +1227,11 @@ analyze_video() {
     INPUT_VIDEO_WIDTH="$current_width"
     INPUT_VIDEO_HEIGHT="$current_height"
     INPUT_VIDEO_SAR="$current_sar"
+    INPUT_VIDEO_CHROMA_LOCATION="$current_chroma"
+    INPUT_VIDEO_COLOR_RANGE="$current_range"
+    INPUT_VIDEO_COLOR_SPACE="$current_space"
+    INPUT_VIDEO_COLOR_TRANSFER="$current_transfer"
+    INPUT_VIDEO_COLOR_PRIMARIES="$current_primaries"
 
     echo "Codec:      $current_codec"
     echo "Resolution: ${current_width}x${current_height}"
@@ -1258,6 +1274,27 @@ build_file_video_filter() {
         # a software scaler after VA-API hardware frames during reinitialization.
         VIDEO_OUTPUT_ARGS=(-noautoscale)
     fi
+
+    case "$INPUT_VIDEO_CHROMA_LOCATION" in
+        ""|unknown|unspecified|N/A) ;;
+        *) VIDEO_OUTPUT_ARGS+=(-chroma_sample_location:v:0 "$INPUT_VIDEO_CHROMA_LOCATION") ;;
+    esac
+    case "$INPUT_VIDEO_COLOR_RANGE" in
+        ""|unknown|unspecified|N/A) ;;
+        *) VIDEO_OUTPUT_ARGS+=(-color_range:v:0 "$INPUT_VIDEO_COLOR_RANGE") ;;
+    esac
+    case "$INPUT_VIDEO_COLOR_SPACE" in
+        ""|unknown|unspecified|N/A) ;;
+        *) VIDEO_OUTPUT_ARGS+=(-colorspace:v:0 "$INPUT_VIDEO_COLOR_SPACE") ;;
+    esac
+    case "$INPUT_VIDEO_COLOR_TRANSFER" in
+        ""|unknown|unspecified|N/A) ;;
+        *) VIDEO_OUTPUT_ARGS+=(-color_trc:v:0 "$INPUT_VIDEO_COLOR_TRANSFER") ;;
+    esac
+    case "$INPUT_VIDEO_COLOR_PRIMARIES" in
+        ""|unknown|unspecified|N/A) ;;
+        *) VIDEO_OUTPUT_ARGS+=(-color_primaries:v:0 "$INPUT_VIDEO_COLOR_PRIMARIES") ;;
+    esac
 }
 
 print_command() {
