@@ -381,8 +381,20 @@ def measure_quality(
     if selected_metric == "vmaf":
         with tempfile.TemporaryDirectory(prefix="av1plan-vmaf-") as raw:
             log = Path(raw) / "vmaf.json"
+            decoded_candidate = Path(raw) / "candidate-decoded.mkv"
+            # The small managed VMAF runtime intentionally focuses on scoring
+            # and may not carry every codec decoder. Capability proof already
+            # established that the host FFmpeg can completely decode this AV1
+            # output, so normalize it losslessly to FFV1 before scoring.
+            decode = subprocess.run([
+                "ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(candidate),
+                "-map", "0:V:0", "-an", "-sn", "-dn", "-c:v", "ffv1",
+                str(decoded_candidate),
+            ], text=True, capture_output=True, check=False)
+            if decode.returncode != 0 or not decoded_candidate.is_file():
+                raise PlanError(decode.stderr.strip() or "Could not normalize the AV1 sample for VMAF.")
             graph = f"[0:v]setpts=PTS-STARTPTS[dist];[1:v]setpts=PTS-STARTPTS[ref];[dist][ref]libvmaf=log_fmt=json:log_path={log}"
-            result = subprocess.run([ffmpeg, "-hide_banner", "-v", "error", "-i", str(candidate), "-i", str(reference), "-lavfi", graph, "-f", "null", "-"], env=env, text=True, capture_output=True, check=False)
+            result = subprocess.run([ffmpeg, "-hide_banner", "-v", "error", "-i", str(decoded_candidate), "-i", str(reference), "-lavfi", graph, "-f", "null", "-"], env=env, text=True, capture_output=True, check=False)
             if result.returncode != 0:
                 raise PlanError(result.stderr.strip() or "VMAF measurement failed.")
             data = json.loads(log.read_text(encoding="utf-8"))

@@ -24,9 +24,28 @@ bash -n "$ENCODER"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$COMPARATOR"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$PLANNER"
 
-[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.2' ]] || fail 'unexpected encoder version'
+[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.3' ]] || fail 'unexpected encoder version'
 [[ $("$ENCODER" --interface-version) == '2' ]] || fail 'unexpected machine-interface version'
 [[ $(python3 "$COMPARATOR" --version) == 'AV1Compare.py 2.0' ]] || fail 'unexpected comparator version'
+python3 - "$COMPARATOR" "$TEST_ROOT" <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("av1compare_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+runtime = Path(sys.argv[2]) / "mode-repair-runtime"
+(runtime / "bin").mkdir(parents=True)
+for name in ("ffmpeg", "ffprobe"):
+    path = runtime / "bin" / name
+    path.write_bytes(b"runtime")
+    path.chmod(0o600)
+module._activate_runtime_executables(runtime)
+assert all(os.access(runtime / "bin" / name, os.X_OK) for name in ("ffmpeg", "ffprobe"))
+PY
 help=$("$ENCODER" --help)
 assert_contains "$help" 'AV1 encoding'
 assert_contains "$help" '--skip-av1'

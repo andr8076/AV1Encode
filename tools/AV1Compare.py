@@ -842,6 +842,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 import urllib.request
@@ -1037,6 +1038,14 @@ def _safe_extract(archive: Path, destination: Path) -> None:
         tar.extractall(destination)
 
 
+def _activate_runtime_executables(runtime: Path) -> None:
+    """Repair executable bits that artifact transports may discard."""
+    for name in ("ffmpeg", "ffprobe"):
+        executable = runtime / "bin" / name
+        if executable.is_file():
+            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+
+
 def select_quality_tools() -> QualityTools:
     override_ffmpeg = os.environ.get("ENCODEAV1_COMPARE_FFMPEG")
     override_ffprobe = os.environ.get("ENCODEAV1_COMPARE_FFPROBE")
@@ -1073,6 +1082,8 @@ def select_quality_tools() -> QualityTools:
     ffmpeg = runtime / "bin" / "ffmpeg"
     ffprobe = runtime / "bin" / "ffprobe"
 
+    _activate_runtime_executables(runtime)
+
     if not (ffmpeg.is_file() and os.access(ffmpeg, os.X_OK) and ffprobe.is_file() and os.access(ffprobe, os.X_OK)):
         cache.mkdir(parents=True, exist_ok=True)
         print("Downloading optional AV1Encode VMAF quality runtime...")
@@ -1099,6 +1110,7 @@ def select_quality_tools() -> QualityTools:
             staged = extracted / "runtime"
             if not (staged / "bin" / "ffmpeg").is_file() or not (staged / "bin" / "ffprobe").is_file():
                 raise RuntimeError("Quality runtime archive is incomplete.")
+            _activate_runtime_executables(staged)
             replacement = cache / "runtime.new"
             if replacement.exists():
                 shutil.rmtree(replacement)
