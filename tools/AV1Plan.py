@@ -28,7 +28,8 @@ SUPPORTED_PROTOCOLS = (1, 2)
 REQUIREMENTS_SCHEMA = "av1encode.requirements"
 PLAN_SCHEMA = "av1encode.plan"
 RESULT_SCHEMA = "av1encode.plan-result"
-PLANNER_VERSION = "1"
+PLANNER_VERSION = "3"
+VMAF_PLANNING_MARGIN = 0.5
 
 
 class PlanError(RuntimeError):
@@ -297,6 +298,10 @@ def recipe_for(encoder: str, requirements: dict[str, Any], source: dict[str, Any
     # These are AV1Encode-owned policy choices, not caller-controlled FFmpeg flags.
     if encoder == "libsvtav1":
         quality = {"kind": "crf", "value": 30, "preset": 6}
+    elif encoder == "av1_vaapi":
+        # AV1 VA-API uses the codec's 0..255 quantizer scale, unlike the
+        # 0..51 quality scale used by NVENC and QSV.
+        quality = {"kind": "qp", "value": 128, "preset": "slow"}
     else:
         quality = {"kind": "qp", "value": 24, "preset": "slow"}
     maximum = requirements["video"]["maximum_height"]
@@ -342,7 +347,7 @@ def encode_sample(source: Path, destination: Path, encoder: str, recipe: dict[st
         )
         args += [
             "-vf", frame_filter, "-c:v", "av1_vaapi", "-rc_mode", "CQP",
-            "-global_quality", str(quality["value"]),
+            "-global_quality", str(quality["value"]), "-enc_time_base:v:0", "demux",
         ]
     else:
         raise PlanError(f"No sample recipe exists for encoder: {encoder}")
@@ -443,41 +448,220 @@ def measure_quality(
     }
 
 
+def planning_quality_target(quality: dict[str, Any]) -> tuple[float, float]:
+    """Return the sampled planning target and margin without changing acceptance policy."""
+    margin = VMAF_PLANNING_MARGIN if quality["metric"] == "vmaf" else 0.0
+    return min(100.0, float(quality["target"]) + margin), margin
+
+
 def predict(root: Path, requirements: dict[str, Any], encoder: str, recipe: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     duration = source["duration_seconds"]
     length = min(float(requirements["evaluation"]["sample_seconds"]), duration)
-    start = max(0.0, (duration - length) / 2.0)
+    # Calibration is sampled, while final acceptance can cover additional windows.
+    # Require a small mean-VMAF cushion during planning so normal sample variance
+    # does not produce plans that sit only a few hundredths above the hard target.
+    planning_score_target, planning_vmaf_margin = planning_quality_target(requirements["quality"])
+
+    # A single centre sample can miss difficult openings/endings and produce an
+    # executable plan that the completed-output validator immediately rejects.
+    # Keep evaluation bounded, but cover early/middle/late content whenever the
+    # source is long enough to contain distinct windows.
+    raw_starts = [max(0.0, duration * fraction - length / 2.0) for fraction in (0.10, 0.50, 0.90)]
+    maximum_start = max(0.0, duration - length)
+    starts: list[float] = []
+    for value in raw_starts:
+        value = round(min(value, maximum_start), 6)
+        if not starts or abs(value - starts[-1]) > 0.001:
+            starts.append(value)
+    tested: dict[int, dict[str, Any]] = {}
+
     with tempfile.TemporaryDirectory(prefix="av1plan-sample-") as raw:
         temp = Path(raw)
-        reference = temp / "reference.mkv"
-        candidate = temp / "candidate.mkv"
-        extract = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.6f}", "-t", f"{length:.6f}", "-i", requirements["input"], "-map", "0:V:0", "-an", "-sn", "-dn", "-c:v", "ffv1", str(reference)], text=True, capture_output=True, check=False)
-        if extract.returncode != 0:
-            raise PlanError(extract.stderr.strip() or "Could not extract the evaluation sample.")
-        elapsed = encode_sample(Path(requirements["input"]), candidate, encoder, recipe, start, length)
-        quality_prediction = measure_quality(
-            root, reference, candidate, requirements["quality"], length
+        references: list[Path] = []
+        for index, sample_start in enumerate(starts):
+            reference = temp / f"reference-{index}.mkv"
+            extract = subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{sample_start:.6f}", "-t", f"{length:.6f}",
+                "-i", requirements["input"], "-map", "0:V:0",
+                "-an", "-sn", "-dn", "-c:v", "ffv1", str(reference),
+            ], text=True, capture_output=True, check=False)
+            if extract.returncode != 0:
+                raise PlanError(extract.stderr.strip() or "Could not extract an evaluation sample.")
+            references.append(reference)
+
+        def evaluate_quality(value: int) -> dict[str, Any]:
+            if value in tested:
+                return tested[value]
+            candidate_recipe = dict(recipe)
+            candidate_recipe["quality"] = dict(recipe["quality"])
+            candidate_recipe["quality"]["value"] = value
+            samples: list[dict[str, Any]] = []
+            for index, (sample_start, reference) in enumerate(zip(starts, references)):
+                candidate = temp / f"candidate-{value}-{index}.mkv"
+                elapsed = encode_sample(
+                    Path(requirements["input"]), candidate, encoder,
+                    candidate_recipe, sample_start, length,
+                )
+                quality = measure_quality(
+                    root, reference, candidate, requirements["quality"], length
+                )
+                samples.append({
+                    "start_seconds": sample_start,
+                    "sample_bytes": candidate.stat().st_size,
+                    "encode_seconds": elapsed,
+                    "quality": quality,
+                })
+
+            worst = min(samples, key=lambda item: float(item["quality"]["predicted_score"]))
+            aggregate_quality = dict(worst["quality"])
+            aggregate_quality["predicted_score"] = round(
+                min(float(item["quality"]["predicted_score"]) for item in samples), 3
+            )
+            if all("predicted_p10" in item["quality"] for item in samples):
+                aggregate_quality["predicted_p10"] = round(
+                    min(float(item["quality"]["predicted_p10"]) for item in samples), 3
+                )
+            if all("predicted_longest_below_floor_seconds" in item["quality"] for item in samples):
+                aggregate_quality["predicted_longest_below_floor_seconds"] = round(
+                    max(float(item["quality"]["predicted_longest_below_floor_seconds"]) for item in samples), 3
+                )
+            base_policy_met = all(
+                bool(item["quality"]["target_met_on_sample"]) for item in samples
+            )
+            aggregate_quality["planning_target"] = round(planning_score_target, 3)
+            aggregate_quality["planning_margin"] = round(planning_vmaf_margin, 3)
+            aggregate_quality["target_met_on_sample"] = (
+                base_policy_met
+                and float(aggregate_quality["predicted_score"]) >= planning_score_target
+            )
+            aggregate_quality["assessment"] = "representative_windows_all_must_pass_with_planning_margin"
+            tested[value] = {
+                "quality_value": value,
+                "sample_bytes": sum(int(item["sample_bytes"]) for item in samples),
+                "encode_seconds": sum(float(item["encode_seconds"]) for item in samples),
+                "quality": aggregate_quality,
+                "samples": samples,
+            }
+            return tested[value]
+
+        if encoder == "av1_vaapi":
+            minimum, maximum, step = 0, 255, 32
+        elif encoder == "libsvtav1":
+            minimum, maximum, step = 0, 63, 8
+        else:
+            minimum, maximum, step = 0, 51, 8
+        initial = int(recipe["quality"]["value"])
+        first = evaluate_quality(initial)
+        passing_value: int | None = initial if first["quality"]["target_met_on_sample"] else None
+        failing_value: int | None = None if passing_value is not None else initial
+
+        if passing_value is not None:
+            probe = initial
+            while probe < maximum:
+                candidate_value = min(maximum, probe + step)
+                candidate = evaluate_quality(candidate_value)
+                if candidate["quality"]["target_met_on_sample"]:
+                    passing_value = candidate_value
+                    probe = candidate_value
+                    if probe == maximum:
+                        break
+                else:
+                    failing_value = candidate_value
+                    break
+        else:
+            probe = initial
+            while probe > minimum:
+                candidate_value = max(minimum, probe - step)
+                candidate = evaluate_quality(candidate_value)
+                if candidate["quality"]["target_met_on_sample"]:
+                    passing_value = candidate_value
+                    break
+                failing_value = candidate_value
+                probe = candidate_value
+
+        if passing_value is not None and failing_value is not None:
+            while failing_value - passing_value > 1:
+                candidate_value = (passing_value + failing_value) // 2
+                candidate = evaluate_quality(candidate_value)
+                if candidate["quality"]["target_met_on_sample"]:
+                    passing_value = candidate_value
+                else:
+                    failing_value = candidate_value
+
+        primary = requirements["optimization"]["primary"]
+        secondary = requirements["optimization"]["secondary"]
+        if primary == "highest_quality":
+            evaluate_quality(minimum)
+
+        def objective(item: dict[str, Any], name: str) -> float:
+            if name == "smallest_output":
+                return float(item["sample_bytes"])
+            if name == "fastest_encoding":
+                return float(item["encode_seconds"])
+            return -float(item["quality"]["predicted_score"])
+
+        passing = [item for item in tested.values() if item["quality"]["target_met_on_sample"]]
+        candidates = passing or list(tested.values())
+        selected = min(
+            candidates,
+            key=lambda item: (
+                objective(item, primary),
+                objective(item, secondary),
+                int(item["quality_value"]),
+            ),
         )
-        predicted_video_bytes = round(candidate.stat().st_size / length * duration)
+        selected_value = int(selected["quality_value"])
+        recipe["quality"]["value"] = selected_value
+        sampled_seconds = length * len(starts)
+        predicted_video_bytes = round(int(selected["sample_bytes"]) / sampled_seconds * duration)
         copied_stream_bytes = round(source["copied_stream_bitrate"] * duration / 8)
         predicted_output_bytes = predicted_video_bytes + copied_stream_bytes
-    realtime = length / elapsed
+        elapsed = float(selected["encode_seconds"])
+        quality_prediction = selected["quality"]
+
+    realtime = sampled_seconds / elapsed
+    calibration = {
+        "strategy": "bounded_representative_quality_search",
+        "selected_quality": selected_value,
+        "quality_kind": recipe["quality"]["kind"],
+        "sample_count": len(starts),
+        "sample_starts_seconds": starts,
+        "planning_vmaf_margin": round(planning_vmaf_margin, 3),
+        "planning_score_target": round(planning_score_target, 3),
+        "candidates": [
+            {
+                "quality_value": int(item["quality_value"]),
+                "sample_bytes": int(item["sample_bytes"]),
+                "encode_seconds": round(float(item["encode_seconds"]), 3),
+                "predicted_score": item["quality"]["predicted_score"],
+                "target_met_on_sample": bool(item["quality"]["target_met_on_sample"]),
+            }
+            for item in sorted(tested.values(), key=lambda item: int(item["quality_value"]))
+        ],
+    }
     return {
-        "scope": "bounded_sample",
-        "sample": {"start_seconds": start, "duration_seconds": length},
+        "scope": "bounded_representative_samples",
+        "sample": {
+            "start_seconds": starts[len(starts) // 2],
+            "duration_seconds": length,
+            "count": len(starts),
+            "starts_seconds": starts,
+        },
         "quality": quality_prediction,
+        "calibration": calibration,
         "size": {
             "predicted_output_bytes": predicted_output_bytes,
             "predicted_video_bytes": predicted_video_bytes,
             "copied_stream_bytes_estimate": copied_stream_bytes,
-            "basis": "sample_video_bitrate_plus_reported_copied_stream_bitrates",
+            "basis": "representative_calibration_samples_plus_reported_copied_stream_bitrates",
         },
         "speed": {
             "measured_realtime_factor": round(realtime, 3),
             "predicted_encode_seconds": round(duration / realtime, 3),
-            "basis": "sample_wall_clock",
+            "basis": "representative_calibration_sample_wall_clock",
         },
-        "confidence": "sampled_not_guaranteed",
+        "confidence": "representative_samples_not_guaranteed",
     }
 
 
@@ -543,7 +727,21 @@ def verify_plan(plan: dict[str, Any], script: Path) -> None:
     if encoder == "av1_vaapi" and isinstance(recipe, dict):
         bit_depth = "10-bit" if recipe.get("vaapi_upload_format") == "p010le" else "8-bit"
         capability["detail"] = str(recipe.get("vaapi_device", "")) + f", {bit_depth} sealed plan"
-    if not isinstance(recipe, dict) or recipe != recipe_for(encoder, requirements, source, capability):
+    expected_recipe = recipe_for(encoder, requirements, source, capability)
+    quality = recipe.get("quality") if isinstance(recipe, dict) else None
+    expected_quality = expected_recipe["quality"]
+    maximum_quality = 255 if encoder == "av1_vaapi" else (63 if encoder == "libsvtav1" else 51)
+    if (
+        not isinstance(quality, dict)
+        or quality.get("kind") != expected_quality["kind"]
+        or quality.get("preset") != expected_quality["preset"]
+        or isinstance(quality.get("value"), bool)
+        or not isinstance(quality.get("value"), int)
+        or not 0 <= quality["value"] <= maximum_quality
+    ):
+        raise PlanError("Plan recipe has an invalid calibrated quality policy.")
+    expected_recipe["quality"]["value"] = quality["value"]
+    if recipe != expected_recipe:
         raise PlanError("Plan recipe is not the current AV1Encode policy recipe.")
     if (plan.get("execution") or {}).get("state") != "ready":
         raise PlanError("Plan is not executable because its sampled quality target was not met.")

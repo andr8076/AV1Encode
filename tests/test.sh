@@ -24,7 +24,7 @@ bash -n "$ENCODER"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$COMPARATOR"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$PLANNER"
 
-[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.4' ]] || fail 'unexpected encoder version'
+[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.5' ]] || fail 'unexpected encoder version'
 [[ $("$ENCODER" --interface-version) == '2' ]] || fail 'unexpected machine-interface version'
 [[ $(python3 "$COMPARATOR" --version) == 'AV1Compare.py 2.0' ]] || fail 'unexpected comparator version'
 python3 - "$COMPARATOR" "$TEST_ROOT" <<'PY'
@@ -170,6 +170,36 @@ configure_encoder
 [[ ${VIDEO_ENCODER_ARGS[2]} == -rc_mode && ${VIDEO_ENCODER_ARGS[3]} == CQP && \
    ${VIDEO_ENCODER_ARGS[4]} == -global_quality && ${VIDEO_ENCODER_ARGS[5]} == 24 ]] || \
     fail 'VA-API quality options are not using FFmpeg-compatible unscoped names'
+INPUT_VIDEO_WIDTH=160
+INPUT_VIDEO_HEIGHT=90
+INPUT_VIDEO_SAR=1:1
+INPUT_VIDEO_CHROMA_LOCATION=''
+INPUT_VIDEO_COLOR_RANGE=''
+INPUT_VIDEO_COLOR_SPACE=''
+INPUT_VIDEO_COLOR_TRANSFER=''
+INPUT_VIDEO_COLOR_PRIMARIES=''
+build_file_video_filter
+[[ ${VIDEO_OUTPUT_ARGS[0]} == -enc_time_base:v:0 &&
+   ${VIDEO_OUTPUT_ARGS[1]} == demux && ${VIDEO_OUTPUT_ARGS[2]} == -noautoscale ]] || \
+    fail 'VA-API output does not preserve the source demuxer time base'
+
+HARDWARE_QP=118
+configure_encoder
+[[ ${VIDEO_ENCODER_ARGS[5]} == 118 ]] || \
+    fail 'VA-API did not accept a calibrated quality value above 51'
+
+if (
+    MODE=hardware
+    FORCED_ENCODER=av1_qsv
+    HARDWARE_QP=118
+    detect_forced_hardware() { HW_TYPE=intel; HW_DETAIL='test QSV'; }
+    configure_encoder
+) >"$TEST_ROOT/qsv-wide-qp.log" 2>&1; then
+    fail 'QSV accepted a VA-API-only quality value above 51'
+fi
+assert_contains "$(<"$TEST_ROOT/qsv-wide-qp.log")" 'valid only for the VA-API AV1 backend'
+HARDWARE_QP=24
+FORCED_ENCODER=av1_vaapi
 
 dry_run=$("$ENCODER" --software --crf 40 --preset 10 --container mkv --dry-run "$TEST_ROOT/source.mkv")
 assert_contains "$dry_run" '-c:v:0 libsvtav1'
@@ -313,9 +343,20 @@ assert plan["plan_id"].startswith("av1p_")
 assert reference["plan_id"] == plan["plan_id"]
 assert plan["selection"]["encoder"] == "libsvtav1"
 assert plan["selection"]["policy_owner"] == "AV1Encode"
-assert plan["recipe"]["quality"] == {"kind": "crf", "preset": 6, "value": 30}
+quality = plan["recipe"]["quality"]
+assert quality["kind"] == "crf"
+assert quality["preset"] == 6
+assert isinstance(quality["value"], int) and 0 <= quality["value"] <= 63
 assert plan["prediction"]["quality"]["metric"] == "ssim_percent"
 assert isinstance(plan["prediction"]["quality"]["predicted_score"], float)
+calibration = plan["prediction"]["calibration"]
+assert calibration["strategy"] == "bounded_representative_quality_search"
+assert calibration["selected_quality"] == quality["value"]
+assert calibration["quality_kind"] == "crf"
+assert calibration["sample_count"] >= 1
+assert calibration["sample_starts_seconds"]
+assert calibration["candidates"]
+assert any(item["target_met_on_sample"] for item in calibration["candidates"])
 assert plan["prediction"]["size"]["predicted_video_bytes"] > 0
 assert plan["prediction"]["size"]["predicted_output_bytes"] >= plan["prediction"]["size"]["predicted_video_bytes"]
 assert plan["prediction"]["speed"]["predicted_encode_seconds"] > 0
@@ -374,6 +415,9 @@ with open(sys.argv[2], encoding="utf-8") as handle:
 changed = copy.deepcopy(plan)
 changed["fingerprints"]["implementation"]["value"] = "sha256:" + "0" * 64
 assert module.calculate_plan_id(changed) != plan["plan_id"]
+assert module.planning_quality_target({"metric":"vmaf", "target":92.0}) == (92.5, 0.5)
+assert module.planning_quality_target({"metric":"vmaf", "target":99.8}) == (100.0, 0.5)
+assert module.planning_quality_target({"metric":"ssim_percent", "target":98.0}) == (98.0, 0.0)
 PY
 
 printf 'All AV1Encode tests passed.\n'

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.3.4, derived from the 265Encode workflow.
+# AV1Encode 1.3.5, derived from the 265Encode workflow.
 # The VA-API filter chain now normalizes every frame to the input stream's initial
 # dimensions before it reaches the encoder, preventing an incompatible software
 # auto-scaler from being inserted after hwupload.
@@ -11,7 +11,7 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.3.5"
 MACHINE_INTERFACE_VERSION="1"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
@@ -79,6 +79,7 @@ Encoding:
       --crf NUMBER         libsvtav1 CRF (0-63), default: 30
       --preset LEVEL       libsvtav1 preset (0-13), default: 6
       --qp NUMBER          Hardware constant-quality QP, default: 24
+                           NVENC/QSV: 0-51; VA-API: 0-255
       --vaapi-device PATH  Force a VA-API render node, for example
                            /dev/dri/renderD128
 
@@ -397,8 +398,11 @@ validate_options() {
         exit 2
     fi
 
-    if ! is_integer_in_range "$HARDWARE_QP" 0 51; then
-        error "--qp must be an integer from 0 to 51."
+    # VA-API AV1 exposes FFmpeg's 0..255 global-quality scale. NVENC and
+    # QSV retain their narrower 0..51 range and are checked after hardware
+    # selection, once AUTO has resolved to a concrete backend.
+    if ! is_integer_in_range "$HARDWARE_QP" 0 255; then
+        error "--qp must be an integer from 0 to 255."
         exit 2
     fi
 
@@ -1138,6 +1142,11 @@ configure_encoder() {
 
     ACTIVE_MODE="hardware"
 
+    if [[ "$HW_TYPE" != vaapi ]] && ! is_integer_in_range "$HARDWARE_QP" 0 51; then
+        error "--qp values above 51 are valid only for the VA-API AV1 backend."
+        exit 2
+    fi
+
     case "$HW_TYPE" in
         nvidia)
             ACTIVE_ENCODER="NVIDIA NVENC"
@@ -1272,7 +1281,10 @@ build_file_video_filter() {
         # The graph above already guarantees a fixed output size. Disabling
         # FFmpeg's implicit end-of-graph scaler prevents it from trying to put
         # a software scaler after VA-API hardware frames during reinitialization.
-        VIDEO_OUTPUT_ARGS=(-noautoscale)
+        # Preserve the input demuxer time base so the completed AV1 stream keeps
+        # the source presentation timestamps. This prevents downstream quality
+        # validation from pairing neighbouring frames after half-frame rounding.
+        VIDEO_OUTPUT_ARGS=(-enc_time_base:v:0 demux -noautoscale)
     fi
 
     case "$INPUT_VIDEO_CHROMA_LOCATION" in
