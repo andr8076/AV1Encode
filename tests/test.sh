@@ -21,10 +21,11 @@ assert_contains() {
 }
 
 bash -n "$ENCODER"
+bash -n "$ROOT/tools/AV1HardwareDecode.sh"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$COMPARATOR"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$PLANNER"
 
-[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.3.5' ]] || fail 'unexpected encoder version'
+[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.4.0' ]] || fail 'unexpected encoder version'
 [[ $("$ENCODER" --interface-version) == '2' ]] || fail 'unexpected machine-interface version'
 [[ $(python3 "$COMPARATOR" --version) == 'AV1Compare.py 2.0' ]] || fail 'unexpected comparator version'
 python3 - "$COMPARATOR" "$TEST_ROOT" <<'PY'
@@ -126,6 +127,7 @@ assert report["features"]["exact_output"] is True
 assert report["features"]["preserve_all"] is True
 assert report["features"]["semantic_planning"] is True
 assert report["features"]["fingerprint_invalidation"] is True
+assert report["features"]["capability_proven_hardware_decode"] is True
 encoders = {item["name"]: item for item in report["encoders"]}
 assert set(encoders) == {"av1_vaapi", "av1_nvenc", "av1_qsv", "libsvtav1"}
 assert encoders["libsvtav1"]["class"] == "software"
@@ -182,6 +184,121 @@ build_file_video_filter
 [[ ${VIDEO_OUTPUT_ARGS[0]} == -enc_time_base:v:0 &&
    ${VIDEO_OUTPUT_ARGS[1]} == demux && ${VIDEO_OUTPUT_ARGS[2]} == -noautoscale ]] || \
     fail 'VA-API output does not preserve the source demuxer time base'
+
+
+# Hardware decoding is a per-source optimization, not a prerequisite for the
+# proven hardware AV1 encoder. Mock only the bounded probe result so these
+# policy tests remain deterministic on CI machines without GPUs.
+(
+    ACTIVE_MODE=hardware
+    ACTIVE_ENCODER='AMD/Linux VA-API'
+    HW_TYPE=vaapi
+    VAAPI_DEVICE=/dev/dri/renderD128
+    VAAPI_UPLOAD_FORMAT=p010le
+    HARDWARE_QP=24
+    DRY_RUN=no
+    AV1ENCODE_DISABLE_HWDECODE=0
+    INPUT_VIDEO_WIDTH=160
+    INPUT_VIDEO_HEIGHT=90
+    INPUT_VIDEO_SAR=1:1
+    INPUT_VIDEO_CHROMA_LOCATION=''
+    INPUT_VIDEO_COLOR_RANGE=''
+    INPUT_VIDEO_COLOR_SPACE=''
+    INPUT_VIDEO_COLOR_TRANSFER=''
+    INPUT_VIDEO_COLOR_PRIMARIES=''
+    VIDEO_ENCODER_ARGS=(-c:v:0 av1_vaapi -rc_mode CQP -global_quality 24)
+    build_file_video_filter
+    probe_hardware_decode_pipeline() { return 0; }
+    configure_input_decode "$TEST_ROOT/source.mkv"
+    [[ $ACTIVE_DECODER == vaapi ]] || fail 'VA-API hardware decode was not selected after a successful source probe'
+    [[ ${INPUT_DECODE_ARGS[0]} == -hwaccel && ${INPUT_DECODE_ARGS[1]} == vaapi ]] || fail 'VA-API decode arguments were not installed'
+    [[ ${VIDEO_FILTER_ARGS[1]} == *scale_vaapi* && ${VIDEO_FILTER_ARGS[1]} != *hwupload* ]] || \
+        fail 'VA-API hardware decode did not keep decoded frames on hardware surfaces'
+)
+
+(
+    ACTIVE_MODE=hardware
+    ACTIVE_ENCODER='AMD/Linux VA-API'
+    HW_TYPE=vaapi
+    VAAPI_DEVICE=/dev/dri/renderD128
+    VAAPI_UPLOAD_FORMAT=p010le
+    HARDWARE_QP=24
+    DRY_RUN=no
+    AV1ENCODE_DISABLE_HWDECODE=0
+    INPUT_VIDEO_WIDTH=160
+    INPUT_VIDEO_HEIGHT=90
+    INPUT_VIDEO_SAR=1:1
+    INPUT_VIDEO_CHROMA_LOCATION=''
+    INPUT_VIDEO_COLOR_RANGE=''
+    INPUT_VIDEO_COLOR_SPACE=''
+    INPUT_VIDEO_COLOR_TRANSFER=''
+    INPUT_VIDEO_COLOR_PRIMARIES=''
+    VIDEO_ENCODER_ARGS=(-c:v:0 av1_vaapi -rc_mode CQP -global_quality 24)
+    build_file_video_filter
+    probe_hardware_decode_pipeline() { return 1; }
+    configure_input_decode "$TEST_ROOT/source.mkv"
+    [[ $ACTIVE_DECODER == software ]] || fail 'failed VA-API decode probe did not fall back to CPU decode'
+    [[ ${#INPUT_DECODE_ARGS[@]} -eq 0 ]] || fail 'failed hardware decode probe left hwaccel arguments active'
+    [[ ${VIDEO_FILTER_ARGS[1]} == *hwupload* ]] || fail 'CPU-decode fallback did not restore the software-to-VAAPI upload path'
+    [[ ${VIDEO_ENCODER_ARGS[1]} == av1_vaapi ]] || fail 'decode fallback changed the proven hardware AV1 encoder'
+)
+
+(
+    ACTIVE_MODE=hardware
+    ACTIVE_ENCODER='NVIDIA NVENC'
+    HW_TYPE=nvidia
+    HARDWARE_QP=24
+    DRY_RUN=no
+    AV1ENCODE_DISABLE_HWDECODE=0
+    INPUT_VIDEO_WIDTH=1920
+    INPUT_VIDEO_HEIGHT=1080
+    INPUT_VIDEO_SAR=1:1
+    VIDEO_FILTER_ARGS=()
+    VIDEO_OUTPUT_ARGS=()
+    VIDEO_ENCODER_ARGS=(-c:v:0 av1_nvenc -rc:v:0 vbr -cq:v:0 24 -preset:v:0 slow -pix_fmt:v:0 yuv420p10le)
+    probe_hardware_decode_pipeline() { return 0; }
+    configure_input_decode "$TEST_ROOT/source.mkv"
+    [[ $ACTIVE_DECODER == nvdec ]] || fail 'NVDEC was not selected after a successful source probe'
+    [[ ${INPUT_DECODE_ARGS[0]} == -hwaccel && ${INPUT_DECODE_ARGS[1]} == cuda ]] || fail 'CUDA decode arguments were not installed'
+    [[ ${VIDEO_FILTER_ARGS[1]} == *scale_cuda* ]] || fail 'NVDEC path is not keeping conversion on CUDA surfaces'
+    ! printf '%s\n' "${VIDEO_ENCODER_ARGS[@]}" | grep -q pix_fmt || fail 'NVDEC path requests a software pixel format before NVENC'
+)
+
+(
+    ACTIVE_MODE=hardware
+    ACTIVE_ENCODER='Intel Quick Sync'
+    HW_TYPE=intel
+    HARDWARE_QP=24
+    DRY_RUN=no
+    AV1ENCODE_DISABLE_HWDECODE=0
+    INPUT_VIDEO_WIDTH=1920
+    INPUT_VIDEO_HEIGHT=1080
+    INPUT_VIDEO_SAR=1:1
+    VIDEO_FILTER_ARGS=()
+    VIDEO_OUTPUT_ARGS=()
+    VIDEO_ENCODER_ARGS=(-c:v:0 av1_qsv -global_quality:v:0 24 -preset:v:0 slow -pix_fmt:v:0 yuv420p10le)
+    probe_hardware_decode_pipeline() { return 0; }
+    configure_input_decode "$TEST_ROOT/source.mkv"
+    [[ $ACTIVE_DECODER == qsv ]] || fail 'QSV decode was not selected after a successful source probe'
+    [[ ${INPUT_DECODE_ARGS[0]} == -hwaccel && ${INPUT_DECODE_ARGS[1]} == qsv ]] || fail 'QSV decode arguments were not installed'
+    [[ ${VIDEO_FILTER_ARGS[1]} == *vpp_qsv* ]] || fail 'QSV decode path is not keeping conversion on QSV surfaces'
+    ! printf '%s\n' "${VIDEO_ENCODER_ARGS[@]}" | grep -q pix_fmt || fail 'QSV decode path requests a software pixel format before AV1 QSV'
+)
+
+(
+    ACTIVE_MODE=hardware
+    ACTIVE_ENCODER='NVIDIA NVENC'
+    HW_TYPE=nvidia
+    HARDWARE_QP=24
+    DRY_RUN=yes
+    AV1ENCODE_DISABLE_HWDECODE=0
+    VIDEO_FILTER_ARGS=()
+    VIDEO_OUTPUT_ARGS=()
+    VIDEO_ENCODER_ARGS=(-c:v:0 av1_nvenc -rc:v:0 vbr -cq:v:0 24 -preset:v:0 slow -pix_fmt:v:0 yuv420p10le)
+    probe_hardware_decode_pipeline() { fail 'dry-run executed a real hardware decode probe'; }
+    configure_input_decode "$TEST_ROOT/source.mkv"
+    [[ $ACTIVE_DECODER == software ]] || fail 'dry-run pretended hardware decoding was proven'
+)
 
 HARDWARE_QP=118
 configure_encoder

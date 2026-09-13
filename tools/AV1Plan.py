@@ -211,7 +211,12 @@ def command_output(command: list[str], env: dict[str, str] | None = None) -> str
 
 
 def implementation_fingerprint(root: Path) -> dict[str, Any]:
-    files = [root / "AV1Encode.sh", root / "tools" / "AV1Plan.py", root / "tools" / "AV1Compare.py"]
+    files = [
+        root / "AV1Encode.sh",
+        root / "tools" / "AV1Plan.py",
+        root / "tools" / "AV1Compare.py",
+        root / "tools" / "AV1HardwareDecode.sh",
+    ]
     record = {
         "planner_version": PLANNER_VERSION,
         "protocol_version": PROTOCOL_VERSION,

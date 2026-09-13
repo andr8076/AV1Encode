@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.3.5, derived from the 265Encode workflow.
-# The VA-API filter chain now normalizes every frame to the input stream's initial
-# dimensions before it reaches the encoder, preventing an incompatible software
-# auto-scaler from being inserted after hwupload.
+# AV1Encode 1.4.0, derived from the 265Encode workflow.
+# Hardware AV1 encoding remains capability-proven and hardware-only in AUTO.
+# Per-file hardware decoding is now an optional, independently proven acceleration:
+# AV1Encode probes the exact source through the selected GPU decode/encode path and
+# falls back only the decode side to CPU when that bounded probe fails.
 # AV1 batch encoder with both interactive and command-line operation.
-# On Linux/AMD, input decoding stays on the CPU and decoded frames are
-# uploaded to the GPU for AV1 encoding through VA-API.
 
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.3.5"
+SCRIPT_VERSION="1.4.0"
 MACHINE_INTERFACE_VERSION="1"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
@@ -49,6 +48,10 @@ ACTIVE_ENCODER_ID=""
 LAST_OUTPUT_FILE=""
 LAST_RESULT_STATUS="not_started"
 MACHINE_RESULT_WRITTEN="no"
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=tools/AV1HardwareDecode.sh
+source "$SCRIPT_DIR/tools/AV1HardwareDecode.sh"
 
 usage() {
     cat <<EOF_USAGE
@@ -885,7 +888,7 @@ show_machine_capabilities() {
     printf '"tool":{"name":"AV1Encode","version":%s},' "$(json_string "$SCRIPT_VERSION")"
     printf '"supported_protocol_versions":[1,2],'
     printf '"codec":"av1","auto_policy":"hardware_only","ffmpeg":%s,' "$(json_string "$ffmpeg_version")"
-    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true},'
+    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true,"capability_proven_hardware_decode":true},'
     if [[ -n $auto_encoder ]]; then
         printf '"auto_encoder":%s,' "$(json_string "$auto_encoder")"
     else
@@ -1417,6 +1420,7 @@ encode_file() {
 
     analyze_video "$input_file" || return 0
     build_file_video_filter
+    configure_input_decode "$input_file"
 
     if [[ -e "$temporary_output" ]]; then
         echo "Removing stale partial output: $temporary_output"
@@ -1464,6 +1468,7 @@ encode_file() {
         -hide_banner
         -y
         "${FFMPEG_GLOBAL_ARGS[@]}"
+        "${INPUT_DECODE_ARGS[@]}"
         -i "$input_file"
         "${stream_map_args[@]}"
         "${VIDEO_FILTER_ARGS[@]}"
