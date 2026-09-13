@@ -19,4 +19,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg ripgrep
       - name: Run regression and encode tests
-        run: bash tests/test.sh
+        run: |
+          bash tests/test.sh
+          bash tests/semantic-v2.sh
