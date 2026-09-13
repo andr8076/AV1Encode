@@ -22,11 +22,16 @@
     "input": {"type": "string", "minLength": 1},
     "output": {"type": "string", "minLength": 1, "pattern": "\\.[mM][kK][vV]$"},
     "hardware_policy": {"enum": ["auto_hardware_only", "manual_software"]},
+    "requested_encoder": {
+      "type": ["string", "null"],
+      "enum": [null, "av1_vaapi", "av1_nvenc", "av1_qsv", "libsvtav1"]
+    },
     "quality": {
       "type": "object",
       "additionalProperties": false,
       "required": ["metric", "target", "p10_minimum", "sustained_floor", "maximum_sustained_seconds"],
       "properties": {
+        "mode": {"enum": ["required", "off"]},
         "metric": {"enum": ["vmaf", "ssim_percent"]},
         "target": {"type": "number", "minimum": 0, "maximum": 100},
         "p10_minimum": {"type": "number", "minimum": 0, "maximum": 100},
@@ -49,7 +54,7 @@
       "required": ["maximum_height", "denoise"],
       "properties": {
         "maximum_height": {"type": ["integer", "null"], "minimum": 144},
-        "denoise": {"enum": ["auto", "never"]}
+        "denoise": {"enum": ["auto", "required", "never"]}
       }
     },
     "preservation": {
@@ -66,7 +71,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["mode"],
-      "properties": {"mode": {"const": "copy_all"}}
+      "properties": {"mode": {"enum": ["copy_all", "archive_optimize"]}}
     },
     "evaluation": {
       "type": "object",
