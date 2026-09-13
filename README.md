@@ -26,6 +26,28 @@ runtime from 265Encode is intentionally not included. AUTO therefore refuses to
 run on those machines. They can still encode on the CPU only when `--software`
 is supplied explicitly and FFmpeg provides `libsvtav1`.
 
+## Hardware decoding
+
+When a hardware AV1 encoder is selected, AV1Encode also tries to keep input
+decoding on the GPU. It does not trust codec names or FFmpeg capability lists:
+for every source file it runs a bounded real decode/filter/AV1-encode probe using
+the exact selected backend.
+
+- AMD/Linux uses VA-API decode and keeps frames on VA-API surfaces for
+  `scale_vaapi` and `av1_vaapi`.
+- NVIDIA uses NVDEC/CUDA decode and keeps frames on CUDA surfaces for
+  `scale_cuda` and `av1_nvenc`.
+- Intel uses Quick Sync decode and keeps frames on QSV surfaces for `vpp_qsv`
+  and `av1_qsv`.
+
+If that per-file hardware-decode probe fails, only decoding falls back to the
+CPU. The already-proven hardware AV1 encoder remains selected; AV1Encode never
+uses a decode failure as permission to fall back to CPU AV1 encoding.
+
+For troubleshooting, set `AV1ENCODE_DISABLE_HWDECODE=1` to force CPU decoding
+while leaving normal encoder selection unchanged. `--dry-run` never performs
+the real hardware-decode probe and therefore previews the safe CPU-decode path.
+
 ## Requirements
 
 - Bash 4 or newer
