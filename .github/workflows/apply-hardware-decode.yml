@@ -1,0 +1,40 @@
+name: Apply hardware decode integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apply-hardware-decode.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply integration patch
+        run: python3 tools/apply-hardware-decode-upgrade.py
+
+      - name: Validate syntax and regression suite
+        run: |
+          bash -n AV1Encode.sh
+          bash -n tools/AV1HardwareDecode.sh
+          python3 -m py_compile tools/AV1Plan.py tools/AV1Compare.py
+          git diff --check
+          bash tests/test.sh
+
+      - name: Commit integrated feature and remove one-shot machinery
+        run: |
+          rm -f tools/apply-hardware-decode-upgrade.py .github/workflows/apply-hardware-decode.yml
+          git add -A
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Enable capability-proven hardware decoding"
+          git push origin HEAD:main
