@@ -24,7 +24,30 @@ jobs:
           sudo apt-get install -y ffmpeg ripgrep
 
       - name: Apply integration patch
-        run: python3 tools/apply-hardware-decode-upgrade.py
+        run: |
+          python3 tools/apply-hardware-decode-upgrade.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("tests/test.sh")
+          text = p.read_text()
+          replacements = {
+              '''    [[ " ${INPUT_DECODE_ARGS[*]} " == *' -hwaccel vaapi '* ]] || fail 'VA-API decode arguments were not installed'\n''': '''    [[ ${INPUT_DECODE_ARGS[0]} == -hwaccel && ${INPUT_DECODE_ARGS[1]} == vaapi ]] || fail 'VA-API decode arguments were not installed'\n''',
+              '''    [[ " ${VIDEO_FILTER_ARGS[*]} " == *scale_vaapi* && " ${VIDEO_FILTER_ARGS[*]} " != *hwupload* ]] || \\\n        fail 'VA-API hardware decode did not keep decoded frames on hardware surfaces'\n''': '''    [[ ${VIDEO_FILTER_ARGS[1]} == *scale_vaapi* && ${VIDEO_FILTER_ARGS[1]} != *hwupload* ]] || \\\n        fail 'VA-API hardware decode did not keep decoded frames on hardware surfaces'\n''',
+              '''    [[ " ${VIDEO_FILTER_ARGS[*]} " == *hwupload* ]] || fail 'CPU-decode fallback did not restore the software-to-VAAPI upload path'\n''': '''    [[ ${VIDEO_FILTER_ARGS[1]} == *hwupload* ]] || fail 'CPU-decode fallback did not restore the software-to-VAAPI upload path'\n''',
+              '''    [[ " ${VIDEO_ENCODER_ARGS[*]} " == *av1_vaapi* ]] || fail 'decode fallback changed the proven hardware AV1 encoder'\n''': '''    [[ ${VIDEO_ENCODER_ARGS[1]} == av1_vaapi ]] || fail 'decode fallback changed the proven hardware AV1 encoder'\n''',
+              '''    [[ " ${INPUT_DECODE_ARGS[*]} " == *' -hwaccel cuda '* ]] || fail 'CUDA decode arguments were not installed'\n''': '''    [[ ${INPUT_DECODE_ARGS[0]} == -hwaccel && ${INPUT_DECODE_ARGS[1]} == cuda ]] || fail 'CUDA decode arguments were not installed'\n''',
+              '''    [[ " ${VIDEO_FILTER_ARGS[*]} " == *scale_cuda* ]] || fail 'NVDEC path is not keeping conversion on CUDA surfaces'\n''': '''    [[ ${VIDEO_FILTER_ARGS[1]} == *scale_cuda* ]] || fail 'NVDEC path is not keeping conversion on CUDA surfaces'\n''',
+              '''    [[ " ${VIDEO_ENCODER_ARGS[*]} " != *pix_fmt* ]] || fail 'NVDEC path requests a software pixel format before NVENC'\n''': '''    ! printf '%s\\n' "${VIDEO_ENCODER_ARGS[@]}" | grep -q pix_fmt || fail 'NVDEC path requests a software pixel format before NVENC'\n''',
+              '''    [[ " ${INPUT_DECODE_ARGS[*]} " == *' -hwaccel qsv '* ]] || fail 'QSV decode arguments were not installed'\n''': '''    [[ ${INPUT_DECODE_ARGS[0]} == -hwaccel && ${INPUT_DECODE_ARGS[1]} == qsv ]] || fail 'QSV decode arguments were not installed'\n''',
+              '''    [[ " ${VIDEO_FILTER_ARGS[*]} " == *vpp_qsv* ]] || fail 'QSV decode path is not keeping conversion on QSV surfaces'\n''': '''    [[ ${VIDEO_FILTER_ARGS[1]} == *vpp_qsv* ]] || fail 'QSV decode path is not keeping conversion on QSV surfaces'\n''',
+              '''    [[ " ${VIDEO_ENCODER_ARGS[*]} " != *pix_fmt* ]] || fail 'QSV decode path requests a software pixel format before AV1 QSV'\n''': '''    ! printf '%s\\n' "${VIDEO_ENCODER_ARGS[@]}" | grep -q pix_fmt || fail 'QSV decode path requests a software pixel format before AV1 QSV'\n''',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected one generated assertion match: {old!r}")
+              text = text.replace(old, new, 1)
+          p.write_text(text)
+          PY
 
       - name: Validate syntax and regression suite
         run: |
