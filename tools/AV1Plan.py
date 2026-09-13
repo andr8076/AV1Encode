@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
 from av1plan_contract import (
     HARDWARE_ENCODERS, PLAN_SCHEMA, PROTOCOL_VERSION, REQUIREMENTS_SCHEMA,
     RESULT_SCHEMA, SUPPORTED_PROTOCOLS, PlanError, atomic_json, canonical,
