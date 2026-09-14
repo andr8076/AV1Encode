@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.4.0, derived from the 265Encode workflow.
+# AV1Encode 1.5.0, derived from the 265Encode workflow.
 # Hardware AV1 encoding remains capability-proven and hardware-only in AUTO.
 # Per-file hardware decoding is now an optional, independently proven acceleration:
 # AV1Encode probes the exact source through the selected GPU decode/encode path and
@@ -10,7 +10,7 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 MACHINE_INTERFACE_VERSION="1"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
