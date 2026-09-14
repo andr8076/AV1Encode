@@ -25,7 +25,7 @@ bash -n "$ROOT/tools/AV1HardwareDecode.sh"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$COMPARATOR"
 PYTHONPYCACHEPREFIX="$TEST_ROOT/pycache" python3 -m py_compile "$PLANNER"
 
-[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.5.0' ]] || fail 'unexpected encoder version'
+[[ $("$ENCODER" --version) == 'AV1Encode.sh 1.4.0' ]] || fail 'unexpected encoder version'
 [[ $("$ENCODER" --interface-version) == '2' ]] || fail 'unexpected machine-interface version'
 [[ $(python3 "$COMPARATOR" --version) == 'AV1Compare.py 2.0' ]] || fail 'unexpected comparator version'
 python3 - "$COMPARATOR" "$TEST_ROOT" <<'PY'
@@ -128,6 +128,11 @@ assert report["features"]["preserve_all"] is True
 assert report["features"]["semantic_planning"] is True
 assert report["features"]["fingerprint_invalidation"] is True
 assert report["features"]["capability_proven_hardware_decode"] is True
+for feature in (
+    "semantic_requested_encoder", "semantic_quality_off", "semantic_scaling",
+    "semantic_denoise", "semantic_audio_optimize",
+):
+    assert report["features"][feature] is True
 encoders = {item["name"]: item for item in report["encoders"]}
 assert set(encoders) == {"av1_vaapi", "av1_nvenc", "av1_qsv", "libsvtav1"}
 assert encoders["libsvtav1"]["class"] == "software"

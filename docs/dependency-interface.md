@@ -16,6 +16,12 @@ version, while `--machine-probe` advertises the complete
 `supported_protocol_versions` list. This lets a newer AV1Encode retain protocol
 1 while adding protocol 2.
 
+Protocol versions establish the JSON contract. Callers that depend on optional
+semantic operations must also require their corresponding `features` flags
+from `--machine-probe`. This prevents a caller from sending newer additive
+requirements to an older implementation that understands protocol 2 but not
+those operations.
+
 ## Protocol 2: semantic evaluate/execute
 
 The caller describes the result it needs, not FFmpeg flags or AV1 settings.
@@ -108,10 +114,6 @@ without changing the normal interactive and command-line experience.
 Callers must read `--interface-version` and accept only protocol versions they
 understand. Additive JSON fields may appear without changing the protocol
 version. Removing or changing the meaning of a field requires a new version.
-The tool version follows semantic versioning and changes whenever planner,
-recipe, execution, or capability behavior changes. Callers may use it as a
-human-readable runtime identity; sealed plans continue to rely on their full
-implementation and runtime fingerprints.
 
 ## Capability discovery
 

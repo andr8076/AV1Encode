@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# AV1Encode 1.5.0, derived from the 265Encode workflow.
+# AV1Encode 1.4.0, derived from the 265Encode workflow.
 # Hardware AV1 encoding remains capability-proven and hardware-only in AUTO.
 # Per-file hardware decoding is now an optional, independently proven acceleration:
 # AV1Encode probes the exact source through the selected GPU decode/encode path and
@@ -10,7 +10,7 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.4.0"
 MACHINE_INTERFACE_VERSION="1"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
@@ -888,7 +888,7 @@ show_machine_capabilities() {
     printf '"tool":{"name":"AV1Encode","version":%s},' "$(json_string "$SCRIPT_VERSION")"
     printf '"supported_protocol_versions":[1,2],'
     printf '"codec":"av1","auto_policy":"hardware_only","ffmpeg":%s,' "$(json_string "$ffmpeg_version")"
-    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true,"capability_proven_hardware_decode":true},'
+    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true,"capability_proven_hardware_decode":true,"semantic_requested_encoder":true,"semantic_quality_off":true,"semantic_scaling":true,"semantic_denoise":true,"semantic_audio_optimize":true},'
     if [[ -n $auto_encoder ]]; then
         printf '"auto_encoder":%s,' "$(json_string "$auto_encoder")"
     else
