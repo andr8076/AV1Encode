@@ -114,6 +114,10 @@ without changing the normal interactive and command-line experience.
 Callers must read `--interface-version` and accept only protocol versions they
 understand. Additive JSON fields may appear without changing the protocol
 version. Removing or changing the meaning of a field requires a new version.
+The tool version follows semantic versioning and changes whenever planner,
+recipe, execution, or capability behavior changes. Callers may use it as a
+human-readable runtime identity; sealed plans continue to rely on their full
+implementation and runtime fingerprints.
 
 ## Capability discovery
 
